@@ -200,6 +200,52 @@ BinanceRest::Result BinanceRest::getExchangeInfo(const std::string& symbol) {
     return impl_->https_request("GET", target, {}, false, {});
 }
 
+BinanceRest::Result BinanceRest::getKlines(const std::string& symbol, const std::string& interval, long long startTime, long long endTime, int limit) {
+    std::ostringstream q;
+    q << "/fapi/v1/klines?symbol=" << symbol << "&interval=" << interval;
+    if (startTime > 0) q << "&startTime=" << startTime;
+    if (endTime > 0)   q << "&endTime=" << endTime;
+    if (limit > 0)     q << "&limit=" << limit;
+    return impl_->https_request("GET", q.str(), {}, false, {});
+}
+
+BinanceRest::Result BinanceRest::getOpenOrders(const std::string& symbol, int recvWindowMs) {
+    using namespace std::chrono;
+    long long ts = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() + impl_->timeOffsetMs;
+    std::ostringstream q; q << "symbol=" << symbol << "&recvWindow=" << recvWindowMs << "&timestamp=" << ts;
+    std::string qs = q.str(); qs += "&signature=" + impl_->hmac_sha256_hex(qs);
+    return impl_->https_request("GET", "/fapi/v1/openOrders?" + qs, {}, false, impl_->apiKey);
+}
+
+BinanceRest::Result BinanceRest::getUserTrades(const std::string& symbol, int limit, int recvWindowMs) {
+    using namespace std::chrono;
+    long long ts = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() + impl_->timeOffsetMs;
+    std::ostringstream q; q << "symbol=" << symbol;
+    if (limit > 0) q << "&limit=" << limit;
+    q << "&recvWindow=" << recvWindowMs << "&timestamp=" << ts;
+    std::string qs = q.str(); qs += "&signature=" + impl_->hmac_sha256_hex(qs);
+    return impl_->https_request("GET", "/fapi/v1/userTrades?" + qs, {}, false, impl_->apiKey);
+}
+
+BinanceRest::Result BinanceRest::cancelOrder(const std::string& symbol, long long orderId, const std::string& origClientOrderId, int recvWindowMs) {
+    using namespace std::chrono;
+    long long ts = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() + impl_->timeOffsetMs;
+    std::ostringstream q; q << "symbol=" << symbol;
+    if (orderId > 0) q << "&orderId=" << orderId;
+    if (!origClientOrderId.empty()) q << "&origClientOrderId=" << url_encode(origClientOrderId);
+    q << "&recvWindow=" << recvWindowMs << "&timestamp=" << ts;
+    std::string qs = q.str(); qs += "&signature=" + impl_->hmac_sha256_hex(qs);
+    return impl_->https_request("DELETE", "/fapi/v1/order?" + qs, {}, false, impl_->apiKey);
+}
+
+BinanceRest::Result BinanceRest::cancelAllOpenOrders(const std::string& symbol, int recvWindowMs) {
+    using namespace std::chrono;
+    long long ts = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() + impl_->timeOffsetMs;
+    std::ostringstream q; q << "symbol=" << symbol << "&recvWindow=" << recvWindowMs << "&timestamp=" << ts;
+    std::string qs = q.str(); qs += "&signature=" + impl_->hmac_sha256_hex(qs);
+    return impl_->https_request("DELETE", "/fapi/v1/allOpenOrders?" + qs, {}, false, impl_->apiKey);
+}
+
 BinanceRest::Result BinanceRest::placeOrder(const std::string& symbol, const std::string& side, const std::string& type, double quantity, double price, const std::string& tif, bool reduceOnly, bool testOnly, int recvWindowMs, const std::string& positionSide, double stopPrice, const std::string& workingType) {
     // Build query
     using namespace std::chrono;

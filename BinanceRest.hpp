@@ -39,6 +39,25 @@ public:
     Result getServerTime();
     Result getAccountInfo(int recvWindowMs = 5000);
     Result getExchangeInfo(const std::string& symbol); // GET /fapi/v1/exchangeInfo?symbol=BTCUSDT
+    // GET /fapi/v1/klines?symbol=BTCUSDT&interval=1m&startTime=...&endTime=...&limit=1500
+    Result getKlines(
+        const std::string& symbol,
+        const std::string& interval,
+        long long startTime = 0,
+        long long endTime = 0,
+        int limit = 500);
+
+    // Orders/Fills
+    Result getOpenOrders(const std::string& symbol, int recvWindowMs = 5000);
+    Result getUserTrades(const std::string& symbol, int limit = 50, int recvWindowMs = 5000);
+
+    // Cancel orders
+    Result cancelOrder(
+        const std::string& symbol,
+        long long orderId = 0,
+        const std::string& origClientOrderId = "",
+        int recvWindowMs = 5000);
+    Result cancelAllOpenOrders(const std::string& symbol, int recvWindowMs = 5000);
 
     // Configure API key/secret (fallback to env)
     void setCredentials(const std::string& apiKey, const std::string& apiSecret);

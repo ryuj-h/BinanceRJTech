@@ -71,8 +71,8 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IncludePath>C:\Users\DevRyu\source\repos\BinanceRJTech\include\include;C:\Program Files\OpenSSL-Win64\include;C:\Users\DevRyu\source\repos\BinanceRJTech\boost_1_89_0;C:\local\boost_1_86_0;$(IncludePath)</IncludePath>
-    <LibraryPath>C:\Users\DevRyu\source\repos\BinanceRJTech\boost_1_89_0;C:\Users\DevRyu\source\repos\BinanceRJTech\boost_1_89_0\libs;C:\Program Files\OpenSSL-Win64\lib\VC\x64\MT;C:\Program Files\OpenSSL-Win64\lib;C:\local\boost_1_86_0\libs;C:\local\boost_1_86_0;$(LibraryPath)</LibraryPath>
+    <IncludePath>C:\Users\User\Desktop\BinanceRJTech\boost_1_89_0;C:\Users\User\Desktop\BinanceRJTech\include\include;C:\Users\DevRyu\source\repos\BinanceRJTech\include\include;C:\Program Files\OpenSSL-Win64\include;C:\Users\DevRyu\source\repos\BinanceRJTech\boost_1_89_0;C:\local\boost_1_86_0;$(IncludePath)</IncludePath>
+    <LibraryPath>C:\Users\User\Desktop\BinanceRJTech\boost_1_89_0\libs;C:\Users\DevRyu\source\repos\BinanceRJTech\boost_1_89_0;C:\Users\DevRyu\source\repos\BinanceRJTech\boost_1_89_0\libs;C:\Program Files\OpenSSL-Win64\lib\VC\x64\MT;C:\Program Files\OpenSSL-Win64\lib;C:\local\boost_1_86_0\libs;C:\local\boost_1_86_0;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>

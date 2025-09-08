@@ -1,0 +1,400 @@
+// Dear ImGui visualization entry point
+
+#include "WebSocket.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+#include <iostream>
+#include <algorithm>
+#include <unordered_map>
+#include <map>
+#include <cmath>
+#include <limits>
+#include <deque>
+#include <tuple>
+#include <utility>
+#include <cstdlib>
+#include <future>
+#include <condition_variable>
+#include <set>
+#include <ctime>
+#include <climits>
+#include <climits>
+
+#include <nlohmann/json.hpp>
+
+// Win32 + D3D11 + Dear ImGui
+#include <windows.h>
+#include <tchar.h>
+#include <d3d11.h>
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3dcompiler.lib")
+
+#include "third_party/imgui/imgui.h"
+#include "third_party/imgui/backends/imgui_impl_win32.h"
+#include "third_party/imgui/backends/imgui_impl_dx11.h"
+#include "BinanceRest.hpp"
+
+// Shared state for visualization
+static std::atomic<int> messageCount{0};
+static std::atomic<int> lastMessageCount{0};
+static std::mutex bookMutex;
+
+struct Level { double price; double qty; };
+static std::vector<Level> g_bids;
+static std::vector<Level> g_asks;
+// Full book aggregates (apply diffs here, render top-N in UI)
+static std::map<double, double, std::greater<double>> g_bookBids; // highest price first
+static std::map<double, double, std::less<double>>    g_bookAsks; // lowest price first
+
+// Public trades buffer (moved to file scope so both receiver and UI can access)
+struct PubTrade { double price; double qty; long long ts; bool isBuy; };
+static std::vector<PubTrade> g_trades;
+static std::mutex tradesMutex;
+
+// ==== Chart state (candlesticks) ====
+struct Candle { long long t0; long long t1; double o; double h; double l; double c; double v; };
+static std::vector<Candle> g_candles;
+static std::mutex g_candlesMutex;
+static std::string g_chartSymbol = "BTCUSDT";
+static std::string g_chartInterval = "1m";
+static bool g_chartLoading = false;
+static bool g_chartLive = true;
+static bool g_showChartWin = true;
+static std::atomic<bool> g_chartStreamRunning{false};
+static std::atomic<double> g_lastTradePrice{0.0};
+
+// Forward decl
+static void RenderChartWindow();
+static void StartOrRestartKlineStream(const std::string& symbolLower, const std::string& interval);
+static void StartOrRestartAggTradeStream(const std::string& symbolLower);
+
+// Worker: connect and receive messages from Binance
+static void receiveOrderBook(const std::string& host, const std::string& port, int id) {
+    try {
+        WebSocket ws(host, port);
+        ws.connect();
+        // Subscribe to full diff depth (not limited to 20 levels)
+        ws.send("{\"method\":\"SUBSCRIBE\",\"params\":[\"btcusdt@depth@100ms\"],\"id\":" + std::to_string(id) + "}");
+
+        for (;;) {
+            std::string message = ws.receive();
+            if (!message.empty()) {
+                try {
+                    using nlohmann::json;
+                    json j = json::parse(message, nullptr, false);
+                    if (j.is_discarded()) goto sleep_short;
+
+                    const json* payload = nullptr;
+                    if (j.contains("b") && j.contains("a")) {
+                        payload = &j;
+                    } else if (j.contains("data") && j["data"].is_object()) {
+                        const auto& d = j["data"];
+                        if (d.contains("b") && d.contains("a")) payload = &d;
+                    }
+                    if (!payload) goto sleep_short;
+
+                    std::vector<Level> bids, asks;
+                    if ((*payload).contains("b") && (*payload)["b"].is_array()) {
+                        for (const auto& v : (*payload)["b"]) {
+                            if (!v.is_array() || v.size() < 2) continue;
+                            const auto& p = v[0];
+                            const auto& q = v[1];
+                            double price = p.is_string() ? std::stod(p.get<std::string>()) : p.get<double>();
+                            double qty   = q.is_string() ? std::stod(q.get<std::string>()) : q.get<double>();
+                            bids.push_back(Level{price, qty});
+                        }
+                    }
+                    if ((*payload).contains("a") && (*payload)["a"].is_array()) {
+                        for (const auto& v : (*payload)["a"]) {
+                            if (!v.is_array() || v.size() < 2) continue;
+                            const auto& p = v[0];
+                            const auto& q = v[1];
+                            double price = p.is_string() ? std::stod(p.get<std::string>()) : p.get<double>();
+                            double qty   = q.is_string() ? std::stod(q.get<std::string>()) : q.get<double>();
+                            asks.push_back(Level{price, qty});
+                        }
+                    }
+                    // Apply diffs to aggregate book (qty == 0 removes the level)
+                    {
+                        std::lock_guard<std::mutex> lock(bookMutex);
+                        const double priceTick = 0.1;  // quantize price to 0.1 tick
+                        auto pquant = [&](double p){ return std::round(p/priceTick)*priceTick; };
+
+                        for (const auto& b : bids) {
+                            double qp = pquant(b.price);
+                            double qq = b.qty; // keep true size, including < 0.1
+                            if (qq <= 0.0) g_bookBids.erase(qp); else g_bookBids[qp] = qq;
+                        }
+                        for (const auto& a : asks) {
+                            double qp = pquant(a.price);
+                            double qq = a.qty; // keep true size, including < 0.1
+                            if (qq <= 0.0) g_bookAsks.erase(qp); else g_bookAsks[qp] = qq;
+                        }
+                        // Optional: cap extreme map sizes to avoid unbounded growth
+                        const size_t cap = 1000;
+                        if (g_bookBids.size() > cap) { auto it = std::next(g_bookBids.begin(), (long)cap); g_bookBids.erase(it, g_bookBids.end()); }
+                        if (g_bookAsks.size() > cap) { auto it = std::next(g_bookAsks.begin(), (long)cap); g_bookAsks.erase(it, g_bookAsks.end()); }
+                    }
+                    messageCount.fetch_add(1, std::memory_order_relaxed);
+                } catch (...) {
+                    // ignore parse errors
+                }
+            } else {
+sleep_short:
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+    } catch (const std::exception& ex) {
+        std::cerr << "Worker error: " << ex.what() << std::endl;
+    }
+}
+
+// Receive public trades and keep small ring buffer
+static void receivePublicTrades(const std::string& host, const std::string& port, const std::string& symbolLower)
+{
+    try {
+        WebSocket ws(host, port);
+        ws.connect();
+        std::string sub = std::string("{\"method\":\"SUBSCRIBE\",\"params\":[\"") + symbolLower + "@trade\"],\"id\":99}";
+        ws.send(sub);
+        for (;;) {
+            std::string msg = ws.receive();
+            if (msg.empty()) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
+            try {
+                using nlohmann::json; json j = json::parse(msg, nullptr, false);
+                if (j.is_discarded()) continue;
+                const json* d = nullptr;
+                if (j.contains("data")) d = &j["data"]; else d = &j;
+                if (!d->is_object()) continue;
+                double price=0, qty=0; long long ts=0; bool isBuy=true;
+                if (d->contains("p")) price = std::stod((*d)["p"].get<std::string>());
+                if (d->contains("q")) qty   = std::stod((*d)["q"].get<std::string>());
+                if (d->contains("T")) ts    = (*d)["T"].get<long long>();
+                if (d->contains("m")) { bool m = (*d)["m"].get<bool>(); isBuy = !m; }
+                if (price>0 && qty>0) {
+                    std::lock_guard<std::mutex> lk(tradesMutex);
+                    g_trades.push_back(PubTrade{price, qty, ts, isBuy});
+                    // Time-based retention to avoid dropping trades within current candle
+                    long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    const long long keep_ms = 10LL * 60LL * 1000LL; // keep last 10 minutes
+                    long long cutoff = now_ms - keep_ms;
+                    size_t cutIdx = 0;
+                    while (cutIdx < g_trades.size() && g_trades[cutIdx].ts < cutoff) ++cutIdx;
+                    if (cutIdx > 0) g_trades.erase(g_trades.begin(), g_trades.begin() + (std::ptrdiff_t)cutIdx);
+                }
+            } catch (...) {}
+        }
+    } catch (...) { /* ignore */ }
+}
+
+// ===== ImGui + D3D11 integration =====
+static ID3D11Device*            g_pd3dDevice = nullptr;
+static ID3D11DeviceContext*     g_pd3dDeviceContext = nullptr;
+static IDXGISwapChain*          g_pSwapChain = nullptr;
+static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
+
+static void CreateRenderTarget()
+{
+    ID3D11Texture2D* pBackBuffer = nullptr;
+    if (SUCCEEDED(g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer))) && pBackBuffer)
+    {
+        g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+        pBackBuffer->Release();
+    }
+}
+
+static void CleanupRenderTarget()
+{
+    if (g_mainRenderTargetView)
+    {
+        g_mainRenderTargetView->Release();
+        g_mainRenderTargetView = nullptr;
+    }
+}
+
+
+static bool CreateDeviceD3D(HWND hWnd)
+{
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    sd.BufferCount = 2;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hWnd;
+    sd.SampleDesc.Count = 1;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    
+    UINT createDeviceFlags = 0;
+    D3D_FEATURE_LEVEL featureLevel;
+    const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
+    HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags,
+        featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+    if (res == DXGI_ERROR_UNSUPPORTED)
+    {
+        res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags,
+            featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+    }
+    if (res != S_OK)
+        return false;
+    CreateRenderTarget();
+    return true;
+}
+
+static void CleanupDeviceD3D()
+{
+    CleanupRenderTarget();
+    if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
+    if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
+    if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
+}
+
+extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        return true;
+    switch (msg)
+    {
+    case WM_SIZE:
+        if (wParam != SIZE_MINIMIZED)
+        {
+            CleanupRenderTarget();
+            g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
+            CreateRenderTarget();
+        }
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xfff0) == SC_KEYMENU) // Disable ALT application menu
+            return 0;
+        break;
+    }
+    return DefWindowProc(hWnd, msg, wParam, lParam);
+}
+
+static void RenderOrderBookUI()
+{
+    // State and UI rendering
+
+    ImGui::Begin("Order Book - BTCUSDT");
+    ImGui::Text("Updates/sec: %d", lastMessageCount.load());
+    ImGui::Separator();
+    static bool s_showBookSettings = false;
+    static bool s_showTradingWin = true;
+    static bool s_showPositionsWin = true;
+    ImGui::Checkbox("Show Settings", &s_showBookSettings);
+    ImGui::SameLine();
+    ImGui::Checkbox("Show Trading", &s_showTradingWin);
+    ImGui::SameLine();
+    ImGui::Checkbox("Show Positions", &s_showPositionsWin);
+    ImGui::SameLine();
+    ImGui::Checkbox("Show Chart", &g_showChartWin);
+    ImGui::Separator();
+
+    // Base quantity (bar unit). Default 20, Auto ON by default
+    static float baseQty = 20.0f; // default unit
+    static bool autoBase = true;
+    if (baseQty < 0.000001f) baseQty = 0.000001f;
+
+    // No animation: render directly at target positions and sizes
+    ImGuiIO& io = ImGui::GetIO();
+    const float dt = std::max(0.0f, io.DeltaTime);
+
+    // Layout: vertical stack (Asks on top, controls, Bids below)
+    const float full_w = ImGui::GetContentRegionAvail().x;
+    const float row_h = ImGui::GetTextLineHeightWithSpacing() * 1.2f;
+    static int displayLevels = 20;
+    displayLevels = std::max(5, std::min(displayLevels, 200));
+    const float half_h = std::max(10, std::min(displayLevels, 60)) * row_h + 10.0f;
+
+    // No per-row or per-price animation state retained
+    // Controls for N-seconds-ago average visual (shared across panes)
+    static float s_lagSec = 5.0f;   // seconds ago
+    static float s_winSec = 0.5f;   // averaging window width
+
+    // Shared trading UI state (accessible from multiple windows)
+    static char t_sym[32] = "BTCUSDT";
+    static float t_orderQty = 0.001f;
+    static float t_limitPrice = 0.0f;
+    static float t_stopPrice = 0.0f;
+    static int t_orderTypeIdx = 0; // 0=MARKET,1=LIMIT,2=STOP_MARKET,3=TAKE_PROFIT_MARKET
+    static int t_tifIdx = 0; // 0=GTC,1=IOC,2=FOK
+    static bool t_reduceOnly = false;
+    static bool t_dualSide = false; // hedge mode
+    static int t_leverage = 20;
+    static int t_marginTypeIdx = 0; // 0=CROSS 1=ISOLATED
+    static std::string t_lastOrderResp;
+
+    // Filters and sizing helpers
+    static double s_qtyStep = 0.001;   // LOT_SIZE/MARKET_LOT_SIZE.stepSize
+    static double s_priceTick = 0.1;   // PRICE_FILTER.tickSize
+    static double s_minQty = 0.0;
+    static double s_availableUSDT = 0.0;   // availableBalance
+    static double s_marginBalanceUSDT = 0.0; // marginBalance
+    static double s_takerRate = 0.0005;    // taker commission rate (default)
+    static double s_makerRate = 0.0002;    // maker commission rate (default)
+    static float  s_sizePct = 10.0f;       // percent of margin balance to use
+    static bool   s_useLeverageForSize = true;
+    static bool   s_sizeForLong = true;    // reference side for auto sizing
+    static std::string s_filtersMsg;
+    static std::vector<std::tuple<std::string,double,double,int,double,std::string,std::string,double>> s_positions; // symbol, amt, entry, lev, upnl, marginType, side, mark
+    static std::mutex s_positionsMutex;
+
+    static std::unique_ptr<BinanceRest> s_rest(new BinanceRest("fapi.binance.com"));
+    if (s_rest) s_rest->setInsecureTLS(false);
+
+    // Background poller to refresh positions/balances every 100ms
+    static bool s_posPollerStarted = false;
+    if (!s_posPollerStarted) {
+        s_posPollerStarted = true;
+        std::thread([&]{
+            try {
+                BinanceRest rest("fapi.binance.com");
+                rest.setInsecureTLS(false);
+                for (;;) {
+                    auto r = rest.getAccountInfo(5000);
+                    if (r.ok) {
+                        try {
+                            using nlohmann::json; auto j = json::parse(r.body, nullptr, false);
+                            auto getd = [](const nlohmann::json& v)->double { if (v.is_string()) return std::stod(v.get<std::string>()); else return v.get<double>(); };
+                            double avail = s_availableUSDT, margin = s_marginBalanceUSDT;
+                            double taker = s_takerRate, maker = s_makerRate;
+                            std::vector<std::tuple<std::string,double,double,int,double,std::string,std::string,double>> pos;
+                            if (j.is_object()) {
+                                if (j.contains("assets") && j["assets"].is_array()) {
+                                    for (auto& a : j["assets"]) {
+                                        if (!a.is_object() || !a.contains("asset")) continue;
+                                        if (a["asset"].get<std::string>() == "USDT") {
+                                            if (a.contains("availableBalance")) avail = getd(a["availableBalance"]);
+                                            if (a.contains("marginBalance"))    margin = getd(a["marginBalance"]);
+                                        }
+                                    }
+                                }
+                                if (j.contains("takerCommissionRate")) taker = getd(j["takerCommissionRate"]);
+                                if (j.contains("makerCommissionRate")) maker = getd(j["makerCommissionRate"]);
+                                if (j.contains("positions") && j["positions"].is_array()) {
+                                    for (auto& p : j["positions"]) {
+                                        if (!p.is_object()) continue;
+                                        std::string sym = p.contains("symbol") ? p["symbol"].get<std::string>() : std::string();
+                                        double amt   = p.contains("positionAmt") ? getd(p["positionAmt"]) : 0.0;
+                                        if (std::abs(amt) < 1e-12) continue;
+                                        double entry = p.contains("entryPrice") ? getd(p["entryPrice"]) : 0.0;
+                                        int lev      = p.contains("leverage") ? (p["leverage"].is_string()? std::stoi(p["leverage"].get<std::string>()) : p["leverage"].get<int>()) : 0;
+                                        double upnl  = p.contains("unrealizedProfit") ? getd(p["unrealizedProfit"]) : 0.0;
+                                        std::string mtype = p.contains("marginType") ? p["marginType"].get<std::string>() : std::string();
+                                        std::string pside = p.contains("positionSide") ? p["positionSide"].get<std::string>() : std::string();
+                                        double mark  = p.contains("markPrice") ? getd(p["markPrice"]) : 0.0;
+                                        pos.emplace_back(sym, amt, entry, lev, upnl, mtype, pside, mark);
+                                    }
+                                }
+                            }
+                            {

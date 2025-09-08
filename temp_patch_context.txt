@@ -1,0 +1,18 @@
+            ImVec2 ts0 = ImGui::CalcTextSize(s0.c_str()); ImVec2 ts1 = ImGui::CalcTextSize(s1.c_str()); ImVec2 ts2 = ImGui::CalcTextSize(s2.c_str());
+            dl->AddText(ImVec2(v1.x - ts0.x - 4, v1.y - ts0.y - 2), IM_COL32(170,170,180,220), s0.c_str());
+            dl->AddText(ImVec2(v1.x - ts1.x - 4, v0.y + (v1.y - v0.y)*0.5f - ts1.y*0.5f), IM_COL32(170,170,180,220), s1.c_str());
+            dl->AddText(ImVec2(v1.x - ts2.x - 4, v0.y + 2), IM_COL32(170,170,180,220), s2.c_str());
+            // Current value label
+            if (!cs.empty()) {
+                double lastV = cs.back().v;
+                std::string cur = std::string("Vol: ") + fmt_units(lastV);
+                dl->AddText(ImVec2(v0.x + 60, v0.y + 4), IM_COL32(220,220,220,255), cur.c_str());
+                // Baseline at current volume level across the pane
+                float y1 = v1.y - 6.0f;
+                float yBase = y1 - (float)((lastV / std::max(1.0, vmax)) * (v1.y - v0.y - 16.0f));
+                dl->AddLine(ImVec2(v0.x+2, yBase), ImVec2(v1.x-2, yBase), IM_COL32(180,180,200,120), 1.0f);
+                // Label at right
+                auto sCur = fmt_units(lastV);
+                ImVec2 tsc = ImGui::CalcTextSize(sCur.c_str());
+                dl->AddRectFilled(ImVec2(v1.x - tsc.x - 8, yBase - tsc.y*0.5f - 1), ImVec2(v1.x - 2, yBase + tsc.y*0.5f + 1), IM_COL32(22,22,26,210));
+                dl->AddText(ImVec2(v1.x - tsc.x - 6, yBase - tsc.y*0.5f), IM_COL32(210,210,230,255), sCur.c_str());
