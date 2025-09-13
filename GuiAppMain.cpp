@@ -57,6 +57,22 @@ struct PubTrade { double price; double qty; long long ts; bool isBuy; };
 static std::vector<PubTrade> g_trades;
 static std::mutex tradesMutex;
 
+// My fills buffer for chart markers
+struct MyFill { long long id; std::string symbol; double price; double qty; long long ts; bool isBuy; };
+static std::vector<MyFill> g_myFills;
+static std::mutex g_myFillsMutex;
+// Orders auto-refresh shared state
+static std::mutex g_ordersMx;
+static std::string g_openOrdersBody;
+static std::string g_userTradesBody;
+static std::atomic<int> g_lastStatusOO{0};
+static std::atomic<int> g_lastStatusUT{0};
+static std::mutex g_chartSymbolMutex; // guard g_chartSymbol for background readers
+// Quick Order: window toggle and percent setting
+static bool  g_showQuickWin = true;   // show Quick Order window by default
+static float s_qo_pct = 100.0f;       // percent of available USDT to use
+// Quick Order window removed
+
 // ==== Chart state (candlesticks) ====
 struct Candle { long long t0; long long t1; double o; double h; double l; double c; double v; };
 static std::vector<Candle> g_candles;
@@ -71,6 +87,9 @@ static std::atomic<double> g_lastTradePrice{0.0};
 // Global fee rates for cross-feature usage (updated by account poller)
 static std::atomic<double> g_takerRate{0.0005};
 static std::atomic<double> g_makerRate{0.0002};
+// Global wallet mirrors for cross-feature usage (set by account poller)
+static std::atomic<double> g_availableUSDT{0.0};
+static std::atomic<double> g_marginBalanceUSDT{0.0};
 
 // Positions overlay for chart (symbol, amount, entry)
 static std::vector<std::tuple<std::string,double,double>> g_posOverlay;
@@ -354,8 +373,9 @@ static void RenderOrderBookUI()
     static bool   s_sizeForLong = true;    // reference side for auto sizing
     static std::string s_filtersMsg;
     // Hotkey settings
-    static bool s_hkQuickLimit = true;   // enable Ctrl+J/K
-    static bool s_hkEmergency = true;    // enable Ctrl+X flatten
+    // Hotkeys removed
+
+    // Quick Order settings removed
     static std::vector<std::tuple<std::string,double,double,int,double,std::string,std::string,double>> s_positions; // symbol, amt, entry, lev, upnl, marginType, side, mark
     static std::mutex s_positionsMutex;
 
@@ -417,6 +437,9 @@ static void RenderOrderBookUI()
                                 g_makerRate.store(maker, std::memory_order_relaxed);
                                 s_positions.swap(pos);
                             }
+                            // Mirror wallet balances globally for cross-window usage
+                            g_availableUSDT.store(avail, std::memory_order_relaxed);
+                            g_marginBalanceUSDT.store(margin, std::memory_order_relaxed);
                             // Publish lightweight overlay for chart
                             std::vector<std::tuple<std::string,double,double>> ov;
                             for (auto &t : s_positions) {
@@ -1076,70 +1099,121 @@ static void RenderOrderBookUI()
                             if (std::abs(amt) > 1e-12 && entry > 0.0) ov.emplace_back(sy, amt, entry);
                         }
                         if (!ov.empty()) { std::lock_guard<std::mutex> lk(g_posOverlayMutex); g_posOverlay.swap(ov); }
+
+                        // Refresh recent user trades for chart markers
+                        auto ut = rest.getUserTrades(s.empty()? g_chartSymbol : s, 50, 3000);
+                        if (ut.ok) {
+                            try {
+                                auto ju = json::parse(ut.body, nullptr, false);
+                                if (ju.is_array()) {
+                                    std::vector<MyFill> tmp;
+                                    for (auto &e : ju) {
+                                        long long id = e.value("id", 0LL);
+                                        bool isBuyer = false; if (e.contains("isBuyer") && e["isBuyer"].is_boolean()) isBuyer = e["isBuyer"].get<bool>(); else if (e.contains("buyer") && e["buyer"].is_boolean()) isBuyer = e["buyer"].get<bool>();
+                                        auto parseD=[&](const nlohmann::json& v)->double{ if (v.is_string()) return std::stod(v.get<std::string>()); else if(v.is_number()) return v.get<double>(); else return 0.0; };
+                                        double price = e.contains("price")? parseD(e["price"]) : 0.0;
+                                        double qty   = e.contains("qty")? parseD(e["qty"]) : 0.0;
+                                        long long ts = e.value("time", 0LL);
+                                        tmp.push_back(MyFill{id, s.empty()? g_chartSymbol : s, price, qty, ts, isBuyer});
+                                    }
+                                    std::lock_guard<std::mutex> lk2(g_myFillsMutex);
+                                    g_myFills.swap(tmp);
+                                }
+                            } catch(...) {}
+                        }
                     } catch (...) {}
                 }).detach();
             }
         };
 
-        // Keyboard shortcuts
+        // Keyboard shortcuts removed
+
+        // Quick Order: hotkeys + minimal window
         {
-            ImGuiIO& ioHK = ImGui::GetIO();
-            if (ioHK.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_B)) { orderTypeIdx = 0; if (valid) send_order(true); }
-            if (ioHK.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) { orderTypeIdx = 0; if (valid) send_order(false); }
-            if (s_hkQuickLimit && ioHK.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_J)) {
-                orderTypeIdx = 1; // LIMIT
-                double refP = (ask>0? ask : (mid>0?mid:0.0));
-                if (refP>0) {
-                    double notional = s_availableUSDT * 1.0 * (s_useLeverageForSize? (double)leverage : 1.0);
-                    double q = notional / refP; q = floor_step(q, s_qtyStep); if (q < s_minQty) q = s_minQty; orderQty = (float)q;
-                    limitPrice = (float)floor_step(refP, s_priceTick);
-                    if (valid) send_order(true);
+            auto floor_step_loc = [](double v, double step)->double { if (step <= 0) return v; double n = std::floor((v + 1e-12) / step); return n * step; };
+            auto ceil_step_loc  = [](double v, double step)->double { if (step <= 0) return v; double n = std::floor((v + 1e-12) / step); double x = n * step; if (x < v - 1e-12) x += step; return x; };
+
+            auto send_quick = [&](bool isBuy){
+                if (!s_rest) return std::string("REST not ready");
+                std::string sym = g_chartSymbol;
+                double ask=0.0, bid=0.0; {
+                    std::lock_guard<std::mutex> lk(bookMutex);
+                    if (!g_bookAsks.empty()) ask = g_bookAsks.begin()->first;
+                    if (!g_bookBids.empty()) bid = g_bookBids.begin()->first;
                 }
-            }
-            if (s_hkQuickLimit && ioHK.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_K)) {
-                orderTypeIdx = 1; // LIMIT
-                double refP = (bid>0? bid : (mid>0?mid:0.0));
-                if (refP>0) {
-                    double notional = s_availableUSDT * 1.0 * (s_useLeverageForSize? (double)leverage : 1.0);
-                    double q = notional / refP; q = floor_step(q, s_qtyStep); if (q < s_minQty) q = s_minQty; orderQty = (float)q;
-                    limitPrice = (float)floor_step(refP, s_priceTick);
-                    if (valid) send_order(false);
-                }
-            }
-            // Emergency flatten (Ctrl+X): limit IOC across all positions
-            if (s_hkEmergency && ioHK.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X)) {
+                double refP = isBuy ? ask : bid; if (refP <= 0.0) return std::string("No book");
+                int lev = t_leverage; bool useLev = s_useLeverageForSize;
+                double notional = s_availableUSDT * (std::max(0.0f, s_qo_pct)/100.0f) * (useLev ? (double)lev : 1.0);
+                double q = notional / refP; q = floor_step_loc(q, s_qtyStep); if (q < s_minQty) q = s_minQty;
+                if (q <= 0.0) return std::string("Qty too small");
+                double qPrice = isBuy ? ceil_step_loc(refP, s_priceTick) : floor_step_loc(refP, s_priceTick);
+                std::string side = isBuy? "BUY" : "SELL";
+                std::string positionSide; if (t_dualSide) positionSide = isBuy?"LONG":"SHORT";
+                auto r = s_rest->placeOrder(sym, side, "LIMIT", q, qPrice, "IOC", false, false, 5000, positionSide, 0.0, "MARK_PRICE");
+                char hdr[96]; snprintf(hdr, sizeof(hdr), "%s LIMIT %s: ", side.c_str(), sym.c_str());
+                return std::string(hdr) + (r.ok?"OK ":"ERR ") + std::to_string(r.status) + "\n" + r.body;
+            };
+
+            auto flatten_all = [&](){
+                if (!s_rest) return std::string("REST not ready");
                 std::vector<std::tuple<std::string,double,double,int,double,std::string,std::string,double>> pos_copy;
-                {
-                    std::lock_guard<std::mutex> lk(s_positionsMutex);
-                    pos_copy = s_positions;
-                }
+                { std::lock_guard<std::mutex> lk(s_positionsMutex); pos_copy = s_positions; }
                 std::string log;
                 for (auto &pt : pos_copy) {
                     const std::string& psym = std::get<0>(pt);
-                    double amt = std::get<1>(pt);
-                    if (std::abs(amt) < 1e-12) continue;
+                    double amt = std::get<1>(pt); if (std::abs(amt) < 1e-12) continue;
                     double mark = std::get<7>(pt);
-                    // determine side and price
-                    std::string side = (amt>0)? "SELL" : "BUY";
-                    double px = 0.0;
-                    if (psym == "BTCUSDT") {
-                        std::lock_guard<std::mutex> lk(bookMutex);
-                        if (amt>0 && !g_bookBids.empty()) px = g_bookBids.begin()->first; // close long at bid
-                        if (amt<0 && !g_bookAsks.empty()) px = g_bookAsks.begin()->first; // close short at ask
-                    }
-                    if (px <= 0.0 && mark > 0.0) px = mark;
-                    double q = std::abs(amt);
-                    // quantize with current s_qtyStep as fallback
-                    auto floor_step2 = [&](double v, double step)->double { if (step <= 0) return v; double n = std::floor((v + 1e-12) / step); return n * step; };
-                    q = floor_step2(q, s_qtyStep); if (q < s_minQty) q = s_minQty;
-                    double qPrice = floor_step2(px, s_priceTick);
-                    std::string positionSide; if (dualSide) positionSide = (amt>0?"LONG":"SHORT");
-                    if (s_rest && q>0 && qPrice>0) {
-                        auto r = s_rest->placeOrder(psym.c_str(), side, "LIMIT", q, qPrice, "IOC", true, false, 5000, positionSide, 0.0, "MARK_PRICE");
-                        log += psym + " FLAT "+ side + " q=" + std::to_string(q) + " @" + std::to_string(qPrice) + " -> " + (r.ok?"OK ":"ERR ") + std::to_string(r.status) + "\n";
-                    }
+                    double ask=0.0, bid=0.0; { std::lock_guard<std::mutex> lk(bookMutex); if (!g_bookAsks.empty()) ask = g_bookAsks.begin()->first; if (!g_bookBids.empty()) bid = g_bookBids.begin()->first; }
+                    bool isLong = (amt>0);
+                    std::string side = isLong? "SELL" : "BUY";
+                    double refP = isLong ? bid : ask; if (refP<=0.0 && mark>0.0) refP = mark;
+                    double q = std::abs(amt); q = floor_step_loc(q, s_qtyStep); if (q < s_minQty) q = s_minQty; if (q<=0.0) continue;
+                    double qPrice = isLong ? floor_step_loc(refP, s_priceTick) : ceil_step_loc(refP, s_priceTick);
+                    std::string positionSide; if (t_dualSide) positionSide = isLong?"LONG":"SHORT";
+                    auto r = s_rest->placeOrder(psym.c_str(), side, "LIMIT", q, qPrice, "IOC", true, false, 5000, positionSide, 0.0, "MARK_PRICE");
+                    log += psym+" FLAT "+side+" q="+std::to_string(q)+" @"+std::to_string(qPrice)+" -> "+(r.ok?"OK ":"ERR ")+std::to_string(r.status)+"\n";
                 }
-                if (!log.empty()) lastOrderResp = log + lastOrderResp;
+                return log;
+            };
+
+            static std::string qo_last;
+            // Hotkeys: Ctrl+J BUY, Ctrl+K SELL, Ctrl+X FLATTEN
+            {
+                ImGuiIO& io = ImGui::GetIO();
+                if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_J)) { g_showQuickWin = true; qo_last = send_quick(true); }
+                if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_K)) { g_showQuickWin = true; qo_last = send_quick(false); }
+                if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X)) { g_showQuickWin = true; qo_last = flatten_all() + qo_last; }
+            }
+
+            if (g_showQuickWin) {
+                ImGui::SetNextWindowSize(ImVec2(380, 220), ImGuiCond_FirstUseEver);
+                if (ImGui::Begin("Quick Order", &g_showQuickWin, ImGuiWindowFlags_NoCollapse)) {
+                    ImGui::Text("Symbol: %s", g_chartSymbol.c_str());
+                    double ask=0.0, bid=0.0; { std::lock_guard<std::mutex> lk(bookMutex); if (!g_bookAsks.empty()) ask=g_bookAsks.begin()->first; if (!g_bookBids.empty()) bid=g_bookBids.begin()->first; }
+                    ImGui::TextDisabled("Best Ask: %.4f   Best Bid: %.4f", ask, bid);
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Size %%"); ImGui::SameLine(); ImGui::SliderFloat("##qo_pct", &s_qo_pct, 1.0f, 100.0f, "%.0f%%");
+                    // Preview qty at mid reference
+                    double ref = (ask>0&&bid>0)? 0.5*(ask+bid) : (ask>0?ask:bid);
+                    if (ref>0) {
+                        int lev=t_leverage; double notional = s_availableUSDT * (s_qo_pct/100.0f) * (s_useLeverageForSize? (double)lev : 1.0); double q = notional/ref; q = floor_step_loc(q, s_qtyStep); ImGui::Text("Est Qty: %.6f", q);
+                    }
+                    ImVec2 bw(ImGui::GetContentRegionAvail().x*0.5f - 4.0f, 40.0f);
+                    ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(40,150,90,255));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(60,180,110,255));
+                    if (ImGui::Button("Quick LONG", bw)) qo_last = send_quick(true);
+                    ImGui::PopStyleColor(2);
+                    ImGui::SameLine();
+                    ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(160,60,60,255));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(190,80,80,255));
+                    if (ImGui::Button("Quick SHORT", bw)) qo_last = send_quick(false);
+                    ImGui::PopStyleColor(2);
+
+                    ImGui::Separator();
+                    if (ImGui::Button("Flatten ALL (IOC)", ImVec2(-FLT_MIN, 0))) { qo_last = flatten_all() + qo_last; }
+                    if (!qo_last.empty()) { ImGui::Separator(); ImGui::BeginChild("qo_resp", ImVec2(0,80), true); ImGui::TextUnformatted(qo_last.c_str()); ImGui::EndChild(); }
+                }
+                ImGui::End();
             }
         }
 
@@ -1157,7 +1231,7 @@ static void RenderOrderBookUI()
         ImGui::PopStyleColor(2);
         ImGui::EndDisabled();
 
-        ImGui::TextDisabled("Hotkeys: Ctrl+B BUY MKT, Ctrl+S SELL MKT, Ctrl+J/K Quick LIMIT 100%%");
+        // Hotkeys help removed
 
         // Response panel
         if (!lastOrderResp.empty()) {
@@ -1185,28 +1259,34 @@ static void RenderOrderBookUI()
         }
         if (ImGui::BeginTabBar("PosTabs")) {
             if (ImGui::BeginTabItem("Positions")) {
-                // Summary profit/loss split
+                // Summary profit/loss split (compute from live mark for real-time feel)
                 double totalP=0.0, totalL=0.0;
                 for (auto& t : pos_local) {
+                    const std::string& ps = std::get<0>(t);
                     double amt = std::get<1>(t);
                     double entry = std::get<2>(t);
-                    double upnl = std::get<4>(t);
                     double refMark = std::get<7>(t);
+                    if (ps == g_chartSymbol && g_lastTradePrice.load() > 0.0) refMark = g_lastTradePrice.load();
                     if (refMark <= 0.0) {
                         std::lock_guard<std::mutex> lk(bookMutex);
                         double ask = (!g_bookAsks.empty()) ? g_bookAsks.begin()->first : 0.0;
                         double bid = (!g_bookBids.empty()) ? g_bookBids.begin()->first : 0.0;
                         refMark = (ask>0 && bid>0) ? (ask+bid)/2.0 : (ask>0?ask:bid);
                     }
+                    double raw = amt * (refMark - entry);
                     double openFee = std::abs(amt) * entry * s_takerRate;
                     double closeFee = std::abs(amt) * refMark * s_takerRate;
-                    double pnl = upnl - openFee - closeFee;
+                    double pnl = raw - openFee - closeFee;
                     if (pnl >= 0) totalP += pnl; else totalL += pnl; // totalL negative sum
                 }
                 double net = totalP + totalL;
                 ImGui::TextColored(ImVec4(0.2f,0.9f,0.5f,1.0f), "Profit:  %.2f USDT", totalP);
                 ImGui::SameLine(); ImGui::TextColored(ImVec4(1.0f,0.4f,0.4f,1.0f), "Loss:  %.2f USDT", totalL);
                 ImGui::SameLine(); ImGui::TextColored(net>=0?ImVec4(0.2f,0.9f,0.5f,1.0f):ImVec4(1.0f,0.4f,0.4f,1.0f), "Net:  %.2f USDT", net);
+                // Wallet-based Net% (use margin balance, fallback to available)
+                double baseWalletSum = (s_marginBalanceUSDT > 1e-12) ? s_marginBalanceUSDT : ((s_availableUSDT > 1e-12) ? s_availableUSDT : 0.0);
+                double netPctSum = (baseWalletSum > 1e-12) ? (net / baseWalletSum) * 100.0 : 0.0;
+                ImGui::SameLine(); ImGui::TextColored(net>=0?ImVec4(0.2f,0.9f,0.5f,1.0f):ImVec4(1.0f,0.4f,0.4f,1.0f), "Net%%:  %.2f%%", netPctSum);
 
                 if (ImGui::BeginTable("PositionsTable", 9, ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders|ImGuiTableFlags_SizingStretchProp)) {
                     ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthFixed, 100.0f);
@@ -1215,7 +1295,7 @@ static void RenderOrderBookUI()
                     ImGui::TableSetupColumn("Entry", ImGuiTableColumnFlags_WidthStretch);
                     ImGui::TableSetupColumn("Lev", ImGuiTableColumnFlags_WidthFixed, 50.0f);
                     ImGui::TableSetupColumn("PnL(fee)", ImGuiTableColumnFlags_WidthStretch);
-                    ImGui::TableSetupColumn("PnL%", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                    ImGui::TableSetupColumn("PnL%(wallet)", ImGuiTableColumnFlags_WidthFixed, 90.0f);
                     ImGui::TableSetupColumn("Margin", ImGuiTableColumnFlags_WidthFixed, 80.0f);
                     ImGui::TableSetupColumn("Rate", ImGuiTableColumnFlags_WidthFixed, 80.0f);
                     ImGui::TableHeadersRow();
@@ -1235,19 +1315,25 @@ static void RenderOrderBookUI()
                 ImGui::TableSetColumnIndex(2); ImGui::Text("%.6f", amt);
                 ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", entry);
                 ImGui::TableSetColumnIndex(4); ImGui::Text("%d", lev);
-                // Fee-adjusted PnL: assume taker open + taker close
+                // Fee-adjusted PnL: compute from live mark for real-time display
                 double refMark = mark;
+                // Prefer ultra-realtime last price for current chart symbol
+                if (psymbol == g_chartSymbol && g_lastTradePrice.load() > 0.0) {
+                    refMark = g_lastTradePrice.load();
+                }
                 if (refMark <= 0.0) {
                     std::lock_guard<std::mutex> lk(bookMutex);
                     double ask = (!g_bookAsks.empty()) ? g_bookAsks.begin()->first : 0.0;
                     double bid = (!g_bookBids.empty()) ? g_bookBids.begin()->first : 0.0;
                     refMark = (ask>0 && bid>0) ? (ask+bid)/2.0 : (ask>0?ask:bid);
                 }
+                double raw = amt * (refMark - entry);
                 double openFee = std::abs(amt) * entry * s_takerRate;
                 double closeFee = std::abs(amt) * refMark * s_takerRate;
-                double pnlFee = upnl - openFee - closeFee;
-                double notion = std::abs(amt) * entry;
-                double pnlPct = (notion > 1e-12) ? (pnlFee / notion) * 100.0 : 0.0;
+                double pnlFee = raw - openFee - closeFee;
+                // Wallet-based PnL percent (use margin balance, fallback to available)
+                double baseWallet = (s_marginBalanceUSDT > 1e-12) ? s_marginBalanceUSDT : ((s_availableUSDT > 1e-12) ? s_availableUSDT : 0.0);
+                double pnlPct = (baseWallet > 1e-12) ? (pnlFee / baseWallet) * 100.0 : 0.0;
                 ImVec4 pnlCol = pnlFee >= 0 ? ImVec4(0.2f,0.9f,0.5f,1.0f) : ImVec4(1.0f,0.4f,0.4f,1.0f);
                 ImGui::TableSetColumnIndex(5); ImGui::TextColored(pnlCol, "%.2f", pnlFee);
                 ImGui::TableSetColumnIndex(6); ImGui::TextColored(pnlCol, "%.2f%%", pnlPct);
@@ -1259,16 +1345,12 @@ static void RenderOrderBookUI()
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Orders")) {
-                static std::string openOrdersBody, userTradesBody; static int lastStatusOO=0, lastStatusUT=0;
-                ImGui::TextDisabled("Open orders and recent fills for %s", g_chartSymbol.c_str());
-                if (ImGui::Button("Refresh Open Orders")) { if (s_rest) { auto r = s_rest->getOpenOrders(g_chartSymbol, 5000); lastStatusOO=r.status; openOrdersBody=r.body; } }
-                ImGui::SameLine(); if (ImGui::Button("Refresh Recent Fills")) { if (s_rest) { auto r = s_rest->getUserTrades(g_chartSymbol, 50, 5000); lastStatusUT=r.status; userTradesBody=r.body; } }
-
-                // Parse open orders
+                // Parse open orders (auto-refreshed every 1s in background)
                 struct OO { long long id; std::string side,type,status,pside; double price,origQty,executedQty; long long time; bool reduceOnly; };
                 std::vector<OO> oos;
+                std::string openOrdersSnapshot; int lastStatusOO_snapshot=0; { std::lock_guard<std::mutex> lk(g_ordersMx); openOrdersSnapshot=g_openOrdersBody; lastStatusOO_snapshot=g_lastStatusOO.load(std::memory_order_relaxed); }
                 try {
-                    using nlohmann::json; auto j = json::parse(openOrdersBody, nullptr, false);
+                    using nlohmann::json; auto j = json::parse(openOrdersSnapshot, nullptr, false);
                     if (j.is_array()) {
                         for (auto &e : j) {
                             OO x{}; x.id = e.contains("orderId")? e["orderId"].get<long long>() : 0;
@@ -1284,10 +1366,9 @@ static void RenderOrderBookUI()
                     }
                 } catch (...) {}
 
-                ImGui::Text("OpenOrders: %s %d  (rows=%d)", (lastStatusOO>=200&&lastStatusOO<300)?"OK":"ERR", lastStatusOO, (int)oos.size());
                 if (ImGui::BeginTable("OOTable", 9, ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders|ImGuiTableFlags_SizingStretchProp)) {
                     ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-                    ImGui::TableSetupColumn("Side", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                    ImGui::TableSetupColumn("Side", ImGuiTableColumnFlags_WidthFixed, 80.0f);
                     ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 80.0f);
                     ImGui::TableSetupColumn("Price", ImGuiTableColumnFlags_WidthStretch);
                     ImGui::TableSetupColumn("Qty", ImGuiTableColumnFlags_WidthStretch);
@@ -1300,7 +1381,18 @@ static void RenderOrderBookUI()
                         auto &x = oos[i];
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0); ImGui::Text("%lld", x.id);
-                        ImGui::TableSetColumnIndex(1); ImGui::TextColored((x.side=="BUY"?ImVec4(0.2f,0.9f,0.5f,1.0f):ImVec4(1.0f,0.4f,0.4f,1.0f)), "%s", x.side.c_str());
+                        // More intuitive side label: LONG/SHORT and Close- semantics
+                        {
+                            const ImVec4 colBuy(0.2f,0.9f,0.5f,1.0f);
+                            const ImVec4 colSell(1.0f,0.4f,0.4f,1.0f);
+                            bool entry = !x.reduceOnly;
+                            std::string label;
+                            ImVec4 col = colBuy;
+                            if (x.pside == "LONG") { label = entry? "LONG":"Close LONG"; col = entry? colBuy: colSell; }
+                            else if (x.pside == "SHORT") { label = entry? "SHORT":"Close SHORT"; col = entry? colSell: colBuy; }
+                            else { if (x.side=="BUY") { label = entry? "LONG":"Close SHORT"; col = colBuy; } else { label = entry? "SHORT":"Close LONG"; col = colSell; } }
+                            ImGui::TableSetColumnIndex(1); ImGui::TextColored(col, "%s", label.c_str());
+                        }
                         ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(x.type.c_str());
                         ImGui::TableSetColumnIndex(3); ImGui::Text("%.4f", x.price);
                         ImGui::TableSetColumnIndex(4); ImGui::Text("%.6f", x.origQty);
@@ -1312,10 +1404,10 @@ static void RenderOrderBookUI()
                         ImGui::PushID((int)i);
                         if (ImGui::BeginPopupContextItem("oo_ctx")) {
                             if (ImGui::MenuItem("Cancel")) {
-                                if (s_rest) { auto r = s_rest->cancelOrder(g_chartSymbol, x.id, "", 5000); t_lastOrderResp = std::string("Cancel ")+std::to_string(x.id)+": "+(r.ok?"OK ":"ERR ")+std::to_string(r.status)+"\n"+r.body; auto r2=s_rest->getOpenOrders(g_chartSymbol,5000); lastStatusOO=r2.status; openOrdersBody=r2.body; }
+                                if (s_rest) { auto r = s_rest->cancelOrder(g_chartSymbol, x.id, "", 5000); t_lastOrderResp = std::string("Cancel ")+std::to_string(x.id)+": "+(r.ok?"OK ":"ERR ")+std::to_string(r.status)+"\n"+r.body; auto r2=s_rest->getOpenOrders(g_chartSymbol,5000); std::lock_guard<std::mutex> lk(g_ordersMx); g_lastStatusOO.store(r2.status, std::memory_order_relaxed); g_openOrdersBody=r2.body; }
                             }
                             if (ImGui::MenuItem("Cancel ALL (symbol)")) {
-                                if (s_rest) { auto r = s_rest->cancelAllOpenOrders(g_chartSymbol, 5000); t_lastOrderResp = std::string("CancelAll ")+g_chartSymbol+": "+(r.ok?"OK ":"ERR ")+std::to_string(r.status)+"\n"+r.body; auto r2=s_rest->getOpenOrders(g_chartSymbol,5000); lastStatusOO=r2.status; openOrdersBody=r2.body; }
+                                if (s_rest) { auto r = s_rest->cancelAllOpenOrders(g_chartSymbol, 5000); t_lastOrderResp = std::string("CancelAll ")+g_chartSymbol+": "+(r.ok?"OK ":"ERR ")+std::to_string(r.status)+"\n"+r.body; auto r2=s_rest->getOpenOrders(g_chartSymbol,5000); std::lock_guard<std::mutex> lk(g_ordersMx); g_lastStatusOO.store(r2.status, std::memory_order_relaxed); g_openOrdersBody=r2.body; }
                             }
                             if (ImGui::MenuItem("Duplicate as LIMIT")) {
                                 snprintf(t_sym, sizeof(t_sym), "%s", g_chartSymbol.c_str());
@@ -1335,11 +1427,15 @@ static void RenderOrderBookUI()
                 // Parse recent fills (userTrades)
                 struct FT { long long id; bool isBuyer; double price, qty; long long time; double commission; std::string commissionAsset; };
                 std::vector<FT> fills;
+                std::string userTradesSnapshot; int lastStatusUT_snapshot=0; { std::lock_guard<std::mutex> lk(g_ordersMx); userTradesSnapshot=g_userTradesBody; lastStatusUT_snapshot=g_lastStatusUT.load(std::memory_order_relaxed); }
                 try {
-                    using nlohmann::json; auto j = json::parse(userTradesBody, nullptr, false);
+                    using nlohmann::json; auto j = json::parse(userTradesSnapshot, nullptr, false);
                     if (j.is_array()) {
                         for (auto &e : j) {
-                            FT f{}; f.id = e.value("id", 0LL); f.isBuyer = e.value("isBuyer", false);
+                            FT f{}; f.id = e.value("id", 0LL);
+                            bool buyer=false; if (e.contains("isBuyer") && e["isBuyer"].is_boolean()) buyer=e["isBuyer"].get<bool>();
+                            else if (e.contains("buyer") && e["buyer"].is_boolean()) buyer=e["buyer"].get<bool>();
+                            f.isBuyer = buyer;
                             auto getd=[&](const nlohmann::json& v)->double{ if (v.is_string()) return std::stod(v.get<std::string>()); else if(v.is_number()) return v.get<double>(); else return 0.0; };
                             f.price = e.contains("price")? getd(e["price"]) : 0.0; f.qty = e.contains("qty")? getd(e["qty"]) : 0.0;
                             f.time = e.value("time", 0LL); f.commission = e.contains("commission")? getd(e["commission"]) : 0.0; f.commissionAsset = e.value("commissionAsset", "");
@@ -1348,8 +1444,16 @@ static void RenderOrderBookUI()
                     }
                 } catch (...) {}
 
+                // Update global my-fills buffer for chart markers (current symbol only)
+                {
+                    std::lock_guard<std::mutex> lk(g_myFillsMutex);
+                    g_myFills.clear();
+                    for (auto &f : fills) {
+                        g_myFills.push_back(MyFill{f.id, g_chartSymbol, f.price, f.qty, f.time, f.isBuyer});
+                    }
+                }
+
                 ImGui::Separator();
-                ImGui::Text("Recent Fills: %s %d (rows=%d)", (lastStatusUT>=200&&lastStatusUT<300)?"OK":"ERR", lastStatusUT, (int)fills.size());
                 if (ImGui::BeginTable("FillsTable", 6, ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders|ImGuiTableFlags_SizingStretchProp)) {
                     ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 100.0f);
                     ImGui::TableSetupColumn("Side", ImGuiTableColumnFlags_WidthFixed, 60.0f);
@@ -1387,31 +1491,8 @@ static void RenderOrderBookUI()
 
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Hotkeys")) {
-                ImGui::Checkbox("Enable Quick LIMIT (Ctrl+J/K)", &s_hkQuickLimit);
-                ImGui::Checkbox("Enable Emergency Flatten (Ctrl+X)", &s_hkEmergency);
-                if (ImGui::Button("Flatten Now (LIMIT IOC)")) {
-                    ImGuiIO& ioHK = ImGui::GetIO(); (void)ioHK; // reuse same routine via key path
-                    // trigger same as Ctrl+X handler
-                    std::vector<std::tuple<std::string,double,double,int,double,std::string,std::string,double>> pos_copy;
-                    { std::lock_guard<std::mutex> lk(s_positionsMutex); pos_copy = s_positions; }
-                    std::string log;
-                    for (auto &pt : pos_copy) {
-                        const std::string& psym = std::get<0>(pt);
-                        double amt = std::get<1>(pt); if (std::abs(amt) < 1e-12) continue;
-                        double mark = std::get<7>(pt); std::string side = (amt>0)?"SELL":"BUY"; double px=0.0;
-                        if (psym == "BTCUSDT") { std::lock_guard<std::mutex> lk(bookMutex); if (amt>0 && !g_bookBids.empty()) px=g_bookBids.begin()->first; if (amt<0 && !g_bookAsks.empty()) px=g_bookAsks.begin()->first; }
-                        if (px<=0.0 && mark>0.0) px=mark; double q=fabs(amt);
-                        auto fstep=[&](double v,double s){ if (s<=0) return v; double n=floor((v+1e-12)/s); return n*s; };
-                        q=fstep(q,s_qtyStep); if (q<s_minQty) q=s_minQty; double qPrice=fstep(px,s_priceTick);
-                        std::string positionSide; if (t_dualSide) positionSide=(amt>0?"LONG":"SHORT");
-                        if (s_rest && q>0 && qPrice>0) { auto r = s_rest->placeOrder(psym.c_str(), side, "LIMIT", q, qPrice, "IOC", true, false, 5000, positionSide, 0.0, "MARK_PRICE"); log += psym+" FLAT "+side+" q="+std::to_string(q)+" @"+std::to_string(qPrice)+" -> "+(r.ok?"OK ":"ERR ")+std::to_string(r.status)+"\n"; }
-                    }
-                    if (!log.empty()) t_lastOrderResp = log + t_lastOrderResp;
-                }
-                ImGui::TextDisabled("Ctrl+B: MARKET BUY, Ctrl+S: MARKET SELL, Ctrl+J/K: Quick LIMIT 100%%, Ctrl+X: Flatten LIMIT IOC");
-                ImGui::EndTabItem();
-            }
+            // Hotkeys tab removed
+            // Quick tab removed
             ImGui::EndTabBar();
         }
         ImGui::End();
@@ -1624,11 +1705,38 @@ static void RenderChartWindow()
     ImGui::SameLine(); ImGui::SetNextItemWidth(110); ImGui::InputInt("History", &histCandles); ImGui::SameLine(); ImGui::TextUnformatted("candles");
     if (ImGui::Button(g_chartLoading?"Loading...":"Load", ImVec2(120,0))) {
         if (!g_chartLoading) {
-            g_chartSymbol = symBuf; g_chartInterval = intervals[ivIdx];
+            {
+                std::lock_guard<std::mutex> lk(g_chartSymbolMutex);
+                g_chartSymbol = symBuf;
+            }
+            g_chartInterval = intervals[ivIdx];
             fetch_klines_parallel(g_chartSymbol, g_chartInterval, std::max(100, histCandles));
             std::string symLower = g_chartSymbol; std::transform(symLower.begin(), symLower.end(), symLower.begin(), ::tolower);
             StartOrRestartKlineStream(symLower, g_chartInterval);
         }
+    }
+
+    // Background poller: Orders + Fills auto-refresh every 1s (always on)
+    static bool s_ordersPollerStarted = false;
+    if (!s_ordersPollerStarted) {
+        s_ordersPollerStarted = true;
+        std::thread([]{
+            try {
+                BinanceRest rest("fapi.binance.com"); rest.setInsecureTLS(false);
+                for (;;) {
+                    std::string sym;
+                    { std::lock_guard<std::mutex> lk(g_chartSymbolMutex); sym = g_chartSymbol; }
+                    auto r1 = rest.getOpenOrders(sym, 5000);
+                    auto r2 = rest.getUserTrades(sym, 50, 5000);
+                    {
+                        std::lock_guard<std::mutex> lk(g_ordersMx);
+                        g_openOrdersBody = r1.body; g_lastStatusOO.store(r1.status, std::memory_order_relaxed);
+                        g_userTradesBody = r2.body; g_lastStatusUT.store(r2.status, std::memory_order_relaxed);
+                    }
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+            } catch (...) { /* keep silent, thread restarts not handled */ }
+        }).detach();
     }
     ImGui::SameLine(); ImGui::Checkbox("AutoUpdate", &g_chartLive); ImGui::SameLine(); ImGui::Checkbox("Crosshair", &showCross);
     ImGui::SameLine(); ImGui::Checkbox("Volume", &showVol); ImGui::SameLine(); ImGui::Checkbox("RSI", &showRSI); ImGui::SameLine(); ImGui::Checkbox("MACD", &showMACD); ImGui::SameLine(); ImGui::Checkbox("SMA", &showSMA);
@@ -1642,7 +1750,7 @@ static void RenderChartWindow()
         ImGui::SameLine(); ImGui::SetNextItemWidth(60); ImGui::InputInt("BBn", &bbLen);
         ImGui::SameLine(); ImGui::SetNextItemWidth(60); ImGui::InputFloat("BBk", &bbK);
     }
-    // Big trade threshold (base asset qty)
+    // Big trade threshold (base asset qty) for 3s text overlay
     static double uiBigTradeQty = 1.0; ImGui::SameLine(); ImGui::SetNextItemWidth(80); ImGui::InputDouble("BigQty", &uiBigTradeQty);
     // (A) button moved to chart overlay bottom-right
 
@@ -1810,12 +1918,25 @@ static void RenderChartWindow()
                 double raw = amt * (lastC - entry);
                 double fees = q * entry * rfee + q * lastC * rfee; // taker open + taker close
                 double pnlFee = raw - fees;
-                double notion = q * entry;
-                double pnlPct = (notion > 1e-12) ? (pnlFee / notion) * 100.0 : 0.0;
-                ImU32 col = pnlFee >= 0 ? IM_COL32(60,200,120,220) : IM_COL32(220,80,80,220);
+                // Wallet-based percent for overlay, consistent with Positions table
+                double mb = g_marginBalanceUSDT.load(std::memory_order_relaxed);
+                double av = g_availableUSDT.load(std::memory_order_relaxed);
+                double baseWallet = (mb > 1e-12) ? mb : ((av > 1e-12) ? av : 0.0);
+                double pnlPct = (baseWallet > 1e-12) ? (pnlFee / baseWallet) * 100.0 : 0.0;
+                // Color by raw PnL sign (직관적: 가격이 유리한 방향이면 초록/불리하면 빨강)
+                ImU32 col = raw >= 0 ? IM_COL32(60,200,120,220) : IM_COL32(220,80,80,220);
                 float y = p_to_y(entry);
-                dl->AddLine(ImVec2(p0.x, y), ImVec2(p1.x, y), col, 2.0f);
-                char lab[160]; snprintf(lab, sizeof(lab), "%s  %.6f @ %.2f  (%.2f%%)", isLong?"LONG":"SHORT", fabs(amt), entry, pnlPct);
+                // dashed entry line across chart
+                float dash = 10.0f, gap = 6.0f; float xx = p0.x;
+                while (xx < p1.x) { float x2 = std::min(p1.x, xx + dash); dl->AddLine(ImVec2(xx, y), ImVec2(x2, y), col, 1.5f); xx += dash + gap; }
+                // Price movement percent from entry (directional)
+                double movePct = 0.0;
+                if (entry > 1e-12) {
+                    double m = (lastC - entry) / entry * 100.0;
+                    movePct = isLong ? m : -m;
+                }
+                char lab[256]; snprintf(lab, sizeof(lab), "%s  %.6f @ %.2f  Δ%.2f%%  PnL %.2f  (W%.2f%%)",
+                    isLong?"LONG":"SHORT", fabs(amt), entry, movePct, pnlFee, pnlPct);
                 ImVec2 ts = ImGui::CalcTextSize(lab);
                 float lx = p0.x + 8.0f; float ly = y - ts.y - 2.0f; if (ly < p0.y) ly = p0.y + 2.0f; if (ly + ts.y + 4 > p1.y) ly = p1.y - (ts.y + 4);
                 dl->AddRectFilled(ImVec2(lx-3, ly-2), ImVec2(lx + ts.x + 4, ly + ts.y + 2), IM_COL32(18,18,20,210));
@@ -1837,12 +1958,13 @@ static void RenderChartWindow()
                         dl->AddLine(ImVec2(x, ybe), ImVec2(x2, ybe), IM_COL32(200,200,200,140), 1.0f);
                         x += dash + gap;
                     }
-                    // label
-                    char bl[64]; snprintf(bl, sizeof(bl), "BE %.2f", bePrice);
+                    // label with percent from entry
+                    double beFromEntryPct = (entry > 1e-12) ? ((bePrice - entry) / entry * 100.0) : 0.0;
+                    char bl[128]; snprintf(bl, sizeof(bl), "BE(fee) @ %.2f  %+0.2f%% from entry", bePrice, beFromEntryPct);
                     ImVec2 bsz = ImGui::CalcTextSize(bl);
                     float bx = p1.x - bsz.x - 8.0f; float by = ybe - bsz.y - 2.0f; if (by < p0.y) by = p0.y + 2.0f; if (by + bsz.y + 4 > p1.y) by = p1.y - (bsz.y + 4);
                     dl->AddRectFilled(ImVec2(bx-3, by-2), ImVec2(bx + bsz.x + 4, by + bsz.y + 2), IM_COL32(18,18,20,190));
-                    dl->AddText(ImVec2(bx, by), IM_COL32(220,220,230,220), bl);
+                    dl->AddText(ImVec2(bx, by), IM_COL32(220,200,90,220), bl);
                 }
             }
         }
@@ -1896,9 +2018,14 @@ static void RenderChartWindow()
             }
         }
 
-        // Prepare SMA arrays
+        // Prepare SMA arrays (cached to avoid recompute every frame)
         auto compute_sma = [&](int n){ std::vector<float> out(cs.size(), NAN); if (n<=1) return out; double s=0; int k=0; for (size_t i=0;i<cs.size();++i){ s += cs[i].c; if (++k>=n){ out[i] = (float)(s/n); s -= cs[i-n+1].c; } } return out; };
-        std::vector<float> smaA, smaB, smaC; if (showSMA){ smaA=compute_sma(std::max(1,sma1)); smaB=compute_sma(std::max(1,sma2)); smaC=compute_sma(std::max(1,sma3)); }
+        static std::vector<float> smaA, smaB, smaC; static size_t sma_cached_n=0; static long long sma_cached_lastT1=0; static int sma_cached_1=0, sma_cached_2=0, sma_cached_3=0;
+        if (showSMA) {
+            int s1=std::max(1,sma1), s2=std::max(1,sma2), s3=std::max(1,sma3);
+            bool need = (sma_cached_n != cs.size()) || (sma_cached_lastT1 != (cs.empty()?0:cs.back().t1)) || (sma_cached_1 != s1) || (sma_cached_2 != s2) || (sma_cached_3 != s3);
+            if (need) { smaA=compute_sma(s1); smaB=compute_sma(s2); smaC=compute_sma(s3); sma_cached_n=cs.size(); sma_cached_lastT1=(cs.empty()?0:cs.back().t1); sma_cached_1=s1; sma_cached_2=s2; sma_cached_3=s3; }
+        }
         auto fmt_units = [&](double v){
             char b[64]; double av=fabs(v);
             if (av>=1e9) { snprintf(b,sizeof(b),"%.2fB", v/1e9); }
@@ -1914,9 +2041,10 @@ static void RenderChartWindow()
         float px_per_ms = (p1.x - p0.x) / (float)(viewT1 - viewT0);
         float barW = std::max(1.0f, (float)(ms_per * px_per_ms * 0.6f));
         ImU32 colUp = IM_COL32(40,200,140,255), colDn = IM_COL32(220,80,80,255);
-        // Draw candles in view
+        // Draw candles in view (early exit when out of range)
         for (auto& k: cs) {
-            if (k.t1 < viewT0 || k.t0 > viewT1) continue;
+            if (k.t1 < viewT0) continue;
+            if (k.t0 > viewT1) break;
             float x = t_to_x((long long)((k.t0 + k.t1)/2));
             float x0 = x - barW*0.5f, x1 = x + barW*0.5f;
             float yO = p_to_y(k.o), yC = p_to_y(k.c), yH = p_to_y(k.h), yL = p_to_y(k.l);
@@ -1930,14 +2058,91 @@ static void RenderChartWindow()
                 dl->AddRectFilled(ImVec2(x0, yO), ImVec2(x1, yC), col);
             }
         }
+
+        // Draw my fills markers (triangles) on chart - improved visibility
+        {
+            std::vector<MyFill> my;
+            { std::lock_guard<std::mutex> lk(g_myFillsMutex); my = g_myFills; }
+            int drawn = 0, labelCount = 0; const int maxDraw=500, maxLabels=80;
+            for (auto &mf : my) {
+                if (mf.symbol != g_chartSymbol) continue;
+                if (mf.ts < viewT0 || mf.ts > viewT1) continue;
+                if (drawn>=maxDraw) break;
+                float x = t_to_x(mf.ts);
+                if (x < p0.x || x > p1.x) continue;
+                float y = p_to_y(mf.price);
+                if (y < p0.y || y > p1.y) continue;
+                float w = 8.0f, h = 9.0f;
+                ImU32 colFill = mf.isBuy ? IM_COL32(0,220,170,240) : IM_COL32(235,90,90,240);
+                ImU32 colOutline = mf.isBuy ? IM_COL32(10,40,30,255) : IM_COL32(50,20,20,255);
+                if (mf.isBuy) {
+                    ImVec2 pA(x, y-1), pB(x-w, y+h), pC(x+w, y+h);
+                    dl->AddTriangleFilled(pA,pB,pC,colFill);
+                    dl->AddTriangle(pA,pB,pC,colOutline, 1.5f);
+                } else {
+                    ImVec2 pA(x, y+1), pB(x-w, y-h), pC(x+w, y-h);
+                    dl->AddTriangleFilled(pA,pB,pC,colFill);
+                    dl->AddTriangle(pA,pB,pC,colOutline, 1.5f);
+                }
+                if (barW >= 6.0f && labelCount < maxLabels) {
+                    char qb[32]; snprintf(qb, sizeof(qb), "%c %.3f", mf.isBuy? 'B':'S', mf.qty);
+                    ImVec2 ts = ImGui::CalcTextSize(qb);
+                    ImVec2 lb = mf.isBuy ? ImVec2(x+6, y+h+3) : ImVec2(x+6, y-h-ts.y-5);
+                    ImVec2 rb = ImVec2(lb.x + ts.x + 6, lb.y + ts.y + 4);
+                    dl->AddRectFilled(lb, rb, IM_COL32(18,18,22,220), 2.0f);
+                    dl->AddText(ImVec2(lb.x+3, lb.y+2), colFill, qb);
+                    labelCount++;
+                }
+                drawn++;
+            }
+        }
+
+        // Entry events (when net position transitions from 0 to non-zero). Mark on candle.
+        {
+            std::vector<MyFill> my;
+            { std::lock_guard<std::mutex> lk(g_myFillsMutex); my = g_myFills; }
+            // Filter current symbol and sort by time
+            std::vector<MyFill> flt; flt.reserve(my.size());
+            for (auto &f : my) if (f.symbol == g_chartSymbol) flt.push_back(f);
+            std::sort(flt.begin(), flt.end(), [](const MyFill& a, const MyFill& b){ return a.ts < b.ts; });
+            struct EntryEvt { long long ts; double price; bool isLong; };
+            std::vector<EntryEvt> evs;
+            double net = 0.0;
+            for (auto &f : flt) {
+                double before = net;
+                net += (f.isBuy ? f.qty : -f.qty);
+                if (std::abs(before) < 1e-12 && std::abs(net) > 1e-12) {
+                    evs.push_back(EntryEvt{f.ts, f.price, net>0});
+                }
+                // crossing through zero (flip), treat as new entry
+                if ((before > 0 && net < 0) || (before < 0 && net > 0)) {
+                    evs.push_back(EntryEvt{f.ts, f.price, net>0});
+                }
+            }
+            // Draw markers on candles in view
+            const int maxEvt = 50; int cnt=0;
+            for (auto &e : evs) {
+                if (e.ts < viewT0 || e.ts > viewT1) continue;
+                // find nearest candle by time center
+                size_t best = 0; long long bestd = LLONG_MAX; for (size_t i=0;i<cs.size();++i){ long long mid = cs[i].t0 + ms_per/2; long long d = llabs(mid - e.ts); if (d<bestd){bestd=d; best=i;} }
+                if (best >= cs.size()) continue;
+                float x = t_to_x(cs[best].t0 + ms_per/2);
+                float y = e.isLong ? p_to_y(cs[best].h) - 6.0f : p_to_y(cs[best].l) + 6.0f;
+                ImU32 col = e.isLong ? IM_COL32(60,220,160,220) : IM_COL32(240,120,120,220);
+                // small diamond marker
+                ImVec2 c(x,y); float sz=5.0f; ImVec2 p1(c.x, c.y-sz), p2(c.x+sz, c.y), p3(c.x, c.y+sz), p4(c.x-sz, c.y);
+                dl->AddTriangleFilled(p1,p2,c,col); dl->AddTriangleFilled(c,p3,p4,col);
+                if (++cnt>=maxEvt) break;
+            }
+        }
         // Candle hover info (OHLCV) when mouse is over a bar
         {
             ImVec2 m = ImGui::GetIO().MousePos;
             if (m.x>=p0.x && m.x<=p1.x && m.y>=p0.y && m.y<=p1.y && ImGui::IsWindowHovered()) {
                 // nearest candle by x
-                size_t best = 0; float bestd = 1e9f;
-                for (size_t i=0;i<cs.size();++i){ float x = t_to_x((long long)((cs[i].t0+cs[i].t1)/2)); float d = fabsf(m.x - x); if (d<bestd){bestd=d;best=i;} }
-                if (best < cs.size()) {
+                size_t best = 0; float bestd = 1e9f; bool found=false;
+                for (size_t i=0;i<cs.size();++i){ if (cs[i].t1 < viewT0) continue; if (cs[i].t0 > viewT1) break; float x = t_to_x((long long)((cs[i].t0+cs[i].t1)/2)); float d = fabsf(m.x - x); if (d<bestd){bestd=d;best=i; found=true;} }
+                if (found && best < cs.size()) {
                     auto &k = cs[best];
                     float x = t_to_x((long long)((k.t0+k.t1)/2)); float x0 = x - barW*0.5f, x1 = x + barW*0.5f;
                     if (m.x >= x0 && m.x <= x1) {
@@ -1949,10 +2154,35 @@ static void RenderChartWindow()
                         tmv = *std::localtime(&sec);
 #endif
                         strftime(tb, sizeof(tb), "%Y-%m-%d %H:%M:%S", &tmv);
+                        // Compute BUY/SELL volume during this candle from public trades
+                        double buySum=0.0, sellSum=0.0; {
+                            std::lock_guard<std::mutex> lk(tradesMutex);
+                            for (auto &t : g_trades) { if (t.ts >= k.t0 && t.ts <= k.t1) { if (t.isBuy) buySum += t.qty; else sellSum += t.qty; } }
+                        }
+                        // Compute my BUY/SELL fills during this candle
+                        double myBuy=0.0, mySell=0.0; {
+                            std::lock_guard<std::mutex> lk2(g_myFillsMutex);
+                            for (auto &mf : g_myFills) { if (mf.symbol==g_chartSymbol && mf.ts>=k.t0 && mf.ts<=k.t1) { if (mf.isBuy) myBuy+=mf.qty; else mySell+=mf.qty; } }
+                        }
+                        // Tooltip at mouse position with improved readability
                         ImGui::BeginTooltip();
-                        ImGui::Text("%s", tb);
-                        ImGui::Text("O %.2f  H %.2f  L %.2f  C %.2f", k.o,k.h,k.l,k.c);
-                        ImGui::Text("V %.6f", k.v);
+                        ImGui::TextColored(ImVec4(0.95f,0.95f,1.0f,1.0f), "%s", tb);
+                        if (ImGui::BeginTable("tt_info", 2, ImGuiTableFlags_SizingFixedFit)) {
+                            ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("Open");  ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", k.o);
+                            ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("High");  ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", k.h);
+                            ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("Low");   ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", k.l);
+                            ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("Close"); ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", k.c);
+                            ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("Volume");ImGui::TableSetColumnIndex(1); ImGui::Text("%.6f", k.v);
+                            ImGui::EndTable();
+                        }
+                        ImGui::Separator();
+                        ImGui::TextColored(ImVec4(0.2f,1.0f,0.6f,1.0f), "BUY   %.3f", buySum);
+                        ImGui::TextColored(ImVec4(1.0f,0.4f,0.4f,1.0f), "SELL  %.3f", sellSum);
+                        if (myBuy>0.0 || mySell>0.0) {
+                            ImGui::Separator();
+                            ImGui::TextColored(ImVec4(0.4f,0.9f,1.0f,1.0f), "My BUY   %.3f", myBuy);
+                            ImGui::TextColored(ImVec4(1.0f,0.7f,0.2f,1.0f), "My SELL  %.3f", mySell);
+                        }
                         ImGui::EndTooltip();
                         // highlight rect
                         float yO = p_to_y(k.o), yC = p_to_y(k.c);
@@ -1961,129 +2191,106 @@ static void RenderChartWindow()
                 }
             }
         }
-        // Big trade pulses (flash & qty text) and impact fireworks at trade price
-        static long long lastSeenTradeTs = 0;
-        struct Pulse { long long ts; double qty; bool isBuy; };
-        static std::vector<Pulse> pulses;
-        struct Impact { long long ts; double price; double qty; bool isBuy; };
-        static std::vector<Impact> impacts;
-        struct MarkerLine { double price; bool isBuy; long long ts; double qty; };
-        static std::vector<MarkerLine> markerLines;
-        static float pulseMs = 1500.0f;
-        static float pulseMaxThick = 6.0f;
-        static float pulseMinThick = 2.0f;
-        static float pulseTextLift = 14.0f;
-        // Snapshot trades
-        std::vector<PubTrade> tr;
+        // === Trade animations ===
+        // Fireworks (per trade, 200ms) and Big trade text overlays (3s)
         {
-            std::lock_guard<std::mutex> lk(tradesMutex);
-            tr = g_trades;
-        }
-        long long maxTs = lastSeenTradeTs;
-        for (auto& t : tr) {
-            if (t.ts <= lastSeenTradeTs) continue;
-            if (t.qty >= uiBigTradeQty) {
-                pulses.push_back(Pulse{t.ts, t.qty, t.isBuy});
-            }
-            // Always spawn impact
-            impacts.push_back(Impact{t.ts, t.price, t.qty, t.isBuy});
-            // Huge trades: persistent marker line
-            if (t.qty >= 10.0) {
-                markerLines.push_back(MarkerLine{t.price, t.isBuy, t.ts, t.qty});
-                if (markerLines.size() > 256) markerLines.erase(markerLines.begin(), markerLines.begin() + (markerLines.size() - 256));
-            }
-            if (t.ts > maxTs) maxTs = t.ts;
-        }
-        if (maxTs > lastSeenTradeTs) lastSeenTradeTs = maxTs;
-        // Draw marker lines (persistent)
-        for (auto &m : markerLines) {
-            float y = p_to_y(m.price);
-            if (y < p0.y || y > p1.y) continue;
-            ImU32 col = m.isBuy ? IM_COL32(80,220,160,180) : IM_COL32(240,120,120,180);
-            dl->AddLine(ImVec2(p0.x, y), ImVec2(p1.x, y), col, 1.5f);
-            char lb[64]; snprintf(lb, sizeof(lb), "%s %.2f", m.isBuy?"BUY":"SELL", m.qty);
-            ImVec2 tsz = ImGui::CalcTextSize(lb);
-            dl->AddRectFilled(ImVec2(p1.x - tsz.x - 8, y - tsz.y*0.5f - 2), ImVec2(p1.x - 2, y + tsz.y*0.5f + 2), IM_COL32(24,24,28,210));
-            dl->AddText(ImVec2(p1.x - tsz.x - 6, y - tsz.y*0.5f), IM_COL32(230,230,240,255), lb);
-        }
+            // Accumulate new trades since last frame
+            static long long lastSeenFwTs = 0;
+            struct Firework { long long ts; long long startMs; double price; double qty; bool isBuy; };
+            static std::vector<Firework> fireworks;
+            struct BigOverlay { long long ts; long long startMs; double price; double qty; bool isBuy; };
+            static std::vector<BigOverlay> bigs;
 
-        // Draw pulses (prune only; visual handled by impacts below)
-        long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        std::vector<Pulse> kept;
-        kept.reserve(pulses.size());
-        for (auto &p : pulses) {
-            float age = (float)(now_ms - p.ts);
-            if (age < 0) age = 0;
-            if (age > pulseMs) continue; // drop
-            kept.push_back(p);
-        }
-        pulses.swap(kept);
+            std::vector<PubTrade> tr;
+            { std::lock_guard<std::mutex> lk(tradesMutex); tr = g_trades; }
+            long long mx = lastSeenFwTs;
+            for (auto &t : tr) {
+                if (t.ts <= lastSeenFwTs) continue;
+                long long now_ms_enq = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                fireworks.push_back(Firework{t.ts, now_ms_enq, t.price, t.qty, t.isBuy});
+                if (t.qty >= uiBigTradeQty) bigs.push_back(BigOverlay{t.ts, now_ms_enq, t.price, t.qty, t.isBuy});
+                if (t.ts > mx) mx = t.ts;
+            }
+            if (mx > lastSeenFwTs) lastSeenFwTs = mx;
 
-        // Draw impact fireworks at exact trade price position and prune
-        std::vector<Impact> keptImp; keptImp.reserve(impacts.size());
-        dl->PushClipRect(p0, p1, true);
-        for (auto &im : impacts) {
-            float age = (float)(now_ms - im.ts);
-            float dur = (im.qty >= uiBigTradeQty) ? 900.0f : 400.0f;
-            if (age < 0) age = 0; if (age > dur) continue;
-            float u = age / dur; float a = 1.0f - u;
-            float cx = t_to_x(im.ts);
-            float cy = p_to_y(im.price);
-            if (cx < p0.x || cx > p1.x || cy < p0.y || cy > p1.y) { keptImp.push_back(im); continue; }
-            ImU32 col = im.isBuy ? IM_COL32(80,240,180,(int)(220*a)) : IM_COL32(255,120,120,(int)(220*a));
-            // expanding ring
-            float r = 2.0f + 20.0f * u;
-            dl->AddCircle(ImVec2(cx, cy), r, col, 16, 1.5f);
-            // starburst rays
-            int rays = 10;
-            for (int i=0;i<rays;i++){
-                const float TWO_PI = 6.28318530717958647692f;
-                float ang = (float)(i * (TWO_PI / rays));
-                float dx = cosf(ang), dy = sinf(ang);
-                float scale = 1.0f + (float)std::min(3.0, std::sqrt(std::max(0.0, im.qty)));
-                float r1 = (3.0f + 10.0f * u) * scale;
-                float r2 = r1 + 8.0f * (1.0f - u) * scale * 0.6f;
-                dl->AddLine(ImVec2(cx + dx*r1, cy + dy*r1), ImVec2(cx + dx*r2, cy + dy*r2), col, 1.5f);
-            }
-            // partial body highlight inside candle: bottom for buy, top for sell
-            // find containing candle
-            size_t idx = (size_t)-1;
-            for (size_t i=0;i<cs.size();++i) { if (im.ts >= cs[i].t0 && im.ts < cs[i].t1) { idx = i; break; } }
-            if (idx == (size_t)-1) {
-                long long bestd = LLONG_MAX; for (size_t i=0;i<cs.size();++i){ long long mid = (cs[i].t0+cs[i].t1)/2; long long d = llabs(mid - im.ts); if (d<bestd){bestd=d; idx=i;}}
-            }
-            if (idx != (size_t)-1) {
+            long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+
+            // Draw fireworks (200ms lifespan)
+            std::vector<Firework> keepFw; keepFw.reserve(fireworks.size());
+            for (auto &fw : fireworks) {
+                float age = (float)(now_ms - fw.startMs);
+                const float dur = 200.0f; if (age < 0) age = 0; if (age > dur) continue;
+                float u = age / dur; float a = 1.0f - u; a = a*a; // quadratic fade
+
+                // Locate candle and compute position within its width (0..1 -> left..right)
+                size_t idx = (size_t)-1;
+                for (size_t i=0;i<cs.size();++i) { if (fw.ts >= cs[i].t0 && fw.ts < cs[i].t1) { idx = i; break; } }
+                if (idx == (size_t)-1) {
+                    long long bestd = LLONG_MAX; for (size_t i=0;i<cs.size();++i){ long long mid=(cs[i].t0+cs[i].t1)/2; long long d= llabs(mid - fw.ts); if (d<bestd){bestd=d; idx=i;}}
+                }
+                if (idx == (size_t)-1) continue;
                 auto &k = cs[idx];
-                float x = t_to_x(k.t0 + ms_per/2);
-                float x0 = x - barW*0.5f, x1 = x + barW*0.5f;
-                float yBodyTop = p_to_y(std::max(k.o, k.c));
-                float yBodyBot = p_to_y(std::min(k.o, k.c));
-                float yTrade = p_to_y(im.price);
-                float y0, y1;
-                if (im.isBuy) { // highlight bottom portion
-                    float yClamp = std::max(std::min(yTrade, yBodyBot), yBodyTop);
-                    y0 = yClamp; y1 = yBodyBot;
-                } else {        // highlight top portion
-                    float yClamp = std::max(std::min(yBodyTop, yTrade), yBodyTop); // clamp into body
-                    y0 = yBodyTop; y1 = std::min(std::max(yTrade, yBodyTop), yBodyBot);
+                float xC = t_to_x(k.t0 + ms_per/2);
+                float xL = xC - barW*0.5f, xR = xC + barW*0.5f;
+                double frac = (k.t1>k.t0) ? (double)(fw.ts - k.t0) / (double)(k.t1 - k.t0) : 0.5; if (frac<0) frac=0; if (frac>1) frac=1;
+                float x = xL + (float)frac * (xR - xL);
+                float y = p_to_y(fw.price);
+                if (x < p0.x || x > p1.x || y < p0.y || y > p1.y) { keepFw.push_back(fw); continue; }
+
+                ImU32 col = fw.isBuy ? IM_COL32(0, 220, 255, (int)(220*a)) : IM_COL32(255, 150, 80, (int)(220*a));
+                // expanding ring
+                float r = 2.0f + 14.0f * u;
+                dl->AddCircle(ImVec2(x, y), r, col, 16, 1.8f);
+                // starburst rays
+                int rays = 8;
+                for (int i=0;i<rays; ++i) {
+                    const float TWO_PI = 6.28318530718f; float ang = (float)i * (TWO_PI / rays);
+                    float dx = cosf(ang), dy = sinf(ang);
+                    float r1 = 3.0f + 8.0f * u;
+                    float r2 = r1 + 8.0f * (1.0f - u);
+                    dl->AddLine(ImVec2(x + dx*r1, y + dy*r1), ImVec2(x + dx*r2, y + dy*r2), col, 1.2f);
                 }
-                if (y1 - y0 > 1.0f) {
-                    ImU32 hcol = im.isBuy ? IM_COL32(60,220,160,(int)(100*a)) : IM_COL32(230,90,90,(int)(100*a));
-                    dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), hcol);
-                }
+                keepFw.push_back(fw);
             }
-            // big trades: show qty text briefly
-            if (im.qty >= uiBigTradeQty) {
-                char tb[32]; snprintf(tb, sizeof(tb), "%c%.2f", im.isBuy?'+':'-', im.qty);
+            fireworks.swap(keepFw);
+
+            // Draw big trade text overlays (3s lifespan)
+            std::vector<BigOverlay> keepBig; keepBig.reserve(bigs.size());
+            for (auto &bo : bigs) {
+                float age = (float)(now_ms - bo.startMs);
+                const float dur = 3000.0f; if (age < 0) age = 0; if (age > dur) continue;
+                size_t idx = (size_t)-1;
+                for (size_t i=0;i<cs.size();++i) { if (bo.ts >= cs[i].t0 && bo.ts < cs[i].t1) { idx = i; break; } }
+                if (idx == (size_t)-1) {
+                    long long bestd = LLONG_MAX; for (size_t i=0;i<cs.size();++i){ long long mid=(cs[i].t0+cs[i].t1)/2; long long d= llabs(mid - bo.ts); if (d<bestd){bestd=d; idx=i;}}
+                }
+                if (idx == (size_t)-1) continue;
+                auto &k = cs[idx];
+                float xC = t_to_x(k.t0 + ms_per/2);
+                float xL = xC - barW*0.5f, xR = xC + barW*0.5f;
+                // Preferred horizontal placement: outside the candle to avoid occlusion
+                float y = p_to_y(bo.price) + (bo.isBuy ? -2.0f : 2.0f);
+
+                char tb[32]; snprintf(tb, sizeof(tb), "%c%.3f", bo.isBuy?'+':'-', bo.qty);
                 ImVec2 tsz = ImGui::CalcTextSize(tb);
-                dl->AddRectFilled(ImVec2(cx - tsz.x*0.5f - 3, cy - r - tsz.y - 6), ImVec2(cx + tsz.x*0.5f + 3, cy - r - 2), IM_COL32(22,22,26,(int)(200*a)));
-                dl->AddText(ImVec2(cx - tsz.x*0.5f, cy - r - tsz.y - 4), col, tb);
+                float txRight = xR + 6.0f;
+                float txLeft  = xL - tsz.x - 6.0f;
+                float tx;
+                if (txRight + tsz.x + 6.0f <= p1.x) tx = txRight; // place to right of candle
+                else if (txLeft >= p0.x) tx = txLeft;              // otherwise to left
+                else tx = std::min(p1.x - tsz.x - 6.0f, std::max(p0.x + 6.0f, xC - tsz.x*0.5f)); // fallback clamp
+
+                float ty = std::min(p1.y - tsz.y - 4.0f, std::max(p0.y + 4.0f, y - tsz.y*0.5f));
+                ImU32 bg = IM_COL32(18,18,22,220);
+                ImU32 col = bo.isBuy ? IM_COL32(0, 220, 255, 240) : IM_COL32(255, 150, 80, 240);
+                dl->AddRectFilled(ImVec2(tx - 3, ty - 2), ImVec2(tx + tsz.x + 3, ty + tsz.y + 2), bg, 3.0f);
+                dl->AddText(ImVec2(tx, ty), col, tb);
+                keepBig.push_back(bo);
             }
-            keptImp.push_back(im);
+            bigs.swap(keepBig);
         }
-        dl->PopClipRect();
-        impacts.swap(keptImp);
         // Draw SMAs
         auto draw_line_series = [&](const std::vector<float>& arr, ImU32 col){
             ImVec2 prev{}; bool has=false; for (size_t i=0;i<cs.size();++i){ if (std::isnan(arr[i])) continue; long long t = cs[i].t0 + ms_per/2; if (t<viewT0||t>viewT1) continue; ImVec2 p = ImVec2(t_to_x(t), p_to_y(arr[i])); if (has) dl->AddLine(prev,p,col,1.5f); prev=p; has=true; }
@@ -2134,7 +2341,9 @@ static void RenderChartWindow()
             }
         }
 
+        // End chart-area clipping
         dl->PopClipRect();
+
         // Reserve a dedicated time-axis strip between chart and volume
         const float axisH = 18.0f;
         // Sub-panels stacked (Vol/RSI/MACD)
