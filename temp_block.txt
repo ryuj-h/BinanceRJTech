@@ -1,0 +1,2 @@
+static std::vector<Level> g_bids;
+struct Level { double price; double qty; };

@@ -1,4 +1,4 @@
-﻿// Dear ImGui visualization entry point
+// Dear ImGui visualization entry point
 
 #include "WebSocket.hpp"
 
@@ -11,6 +11,7 @@
 #include <iostream>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <map>
 #include <cmath>
 #include <limits>
@@ -61,6 +62,20 @@ static std::mutex tradesMutex;
 struct MyFill { long long id; std::string symbol; double price; double qty; long long ts; bool isBuy; };
 static std::vector<MyFill> g_myFills;
 static std::mutex g_myFillsMutex;
+// Parsed recent fills for current symbol (fees included)
+struct ParsedFill { long long id; bool isBuyer; double price; double qty; long long time; double commission; std::string commissionAsset; };
+static std::vector<ParsedFill> g_lastFills;
+static std::mutex g_fillsMutex;
+// Fee tracking per symbol (cumulative, monotonic during open positions)
+static std::mutex g_feeMx;
+static std::unordered_map<std::string, double> g_feeSpentBySymbolUSDT; // symbol -> USDT fee spent
+static std::unordered_map<std::string, std::unordered_set<long long>> g_seenTradeIdsBySymbol; // symbol -> seen trade ids
+// Open position symbols for cross-thread coordination
+static std::mutex g_openSymbolsMx;
+static std::set<std::string> g_openPosSymbols;
+// Leverage lookup per open symbol (for ROI in overlays)
+static std::mutex g_levMx;
+static std::unordered_map<std::string, int> g_leverageBySymbol;
 // Orders auto-refresh shared state
 static std::mutex g_ordersMx;
 static std::string g_openOrdersBody;
@@ -90,6 +105,24 @@ static std::atomic<double> g_makerRate{0.0002};
 // Global wallet mirrors for cross-feature usage (set by account poller)
 static std::atomic<double> g_availableUSDT{0.0};
 static std::atomic<double> g_marginBalanceUSDT{0.0};
+// Public price mirrors for conversions (BNB->USDT)
+static std::atomic<double> g_bnbUsdt{0.0};
+// Exchange filters (tick/step/min) mirrored globally for chart interactions
+static std::atomic<double> g_priceTick{0.1};
+static std::atomic<double> g_qtyStep{0.001};
+static std::atomic<double> g_minQty{0.0};
+
+// In-chart order dialog state
+static bool   g_showOrderDialog = false;
+static bool   g_dialogFocusNext = false;
+static int    g_dialogSideIdx = 0; // 0=BUY/LONG, 1=SELL/SHORT
+static int    g_dialogTypeIdx = 1; // 0=MARKET,1=LIMIT
+static int    g_dialogTifIdx = 0;  // 0=GTC,1=IOC,2=FOK
+static bool   g_dialogReduceOnly = false;
+static char   g_dialogPosSide[8] = ""; // "LONG"/"SHORT" or empty
+static float  g_dialogQty = 0.001f;
+static double g_dialogPrice = 0.0; // prefilled from crosshair
+static std::string g_dialogResp;
 
 // Positions overlay for chart (symbol, amount, entry)
 static std::vector<std::tuple<std::string,double,double>> g_posOverlay;
@@ -99,6 +132,134 @@ static std::mutex g_posOverlayMutex;
 static void RenderChartWindow();
 static void StartOrRestartKlineStream(const std::string& symbolLower, const std::string& interval);
 static void StartOrRestartAggTradeStream(const std::string& symbolLower);
+// Global background pollers (start once regardless of tabs)
+static void StartOrdersAndFillsPollerOnce();
+static void StartBnbTickerPollerOnce();
+
+static void StartOrdersAndFillsPollerOnce() {
+    static bool started = false; if (started) return; started = true;
+    std::thread([]{
+        try {
+            BinanceRest rest("fapi.binance.com"); rest.setInsecureTLS(false);
+            for (;;) {
+                // Chart symbol snapshot
+                std::string symChart; { std::lock_guard<std::mutex> lk(g_chartSymbolMutex); symChart = g_chartSymbol; }
+                // Refresh open orders for chart symbol
+                auto r1 = rest.getOpenOrders(symChart, 5000);
+                { std::lock_guard<std::mutex> lk(g_ordersMx); g_openOrdersBody = r1.body; g_lastStatusOO.store(r1.status, std::memory_order_relaxed); }
+
+                // Refresh last fills snapshot for chart symbol (for UI details)
+                try {
+                    auto rChart = rest.getUserTrades(symChart, 200, 5000);
+                    { std::lock_guard<std::mutex> lk(g_ordersMx); g_userTradesBody = rChart.body; }
+                    g_lastStatusUT.store(rChart.status, std::memory_order_relaxed);
+                    using nlohmann::json; auto j = json::parse(rChart.body, nullptr, false);
+                    std::vector<ParsedFill> pf;
+                    if (j.is_array()) {
+                        for (auto &e : j) {
+                            ParsedFill f{}; f.id = e.value("id", 0LL);
+                            bool buyer=false; if (e.contains("isBuyer") && e["isBuyer"].is_boolean()) buyer=e["isBuyer"].get<bool>(); else if (e.contains("buyer") && e["buyer"].is_boolean()) buyer=e["buyer"].get<bool>();
+                            f.isBuyer = buyer;
+                            auto getd=[&](const nlohmann::json& v)->double{ if (v.is_string()) return std::stod(v.get<std::string>()); else if(v.is_number()) return v.get<double>(); else return 0.0; };
+                            f.price = e.contains("price")? getd(e["price"]) : 0.0; f.qty = e.contains("qty")? getd(e["qty"]) : 0.0;
+                            f.time = e.value("time", 0LL); f.commission = e.contains("commission")? getd(e["commission"]) : 0.0; f.commissionAsset = e.value("commissionAsset", "");
+                            pf.push_back(std::move(f));
+                        }
+                    }
+                    { std::lock_guard<std::mutex> lk(g_fillsMutex); g_lastFills.swap(pf); }
+                } catch (...) {}
+
+                // Build fetch list from currently open positions + chart symbol
+                std::set<std::string> fetchSyms; { std::lock_guard<std::mutex> lk(g_openSymbolsMx); fetchSyms = g_openPosSymbols; }
+                fetchSyms.insert(symChart);
+                // Snapshot current net position amounts (symbol -> amt)
+                std::unordered_map<std::string,double> posAmtSnap; {
+                    std::lock_guard<std::mutex> lk(g_posOverlayMutex);
+                    for (auto &t : g_posOverlay) {
+                        posAmtSnap[std::get<0>(t)] = std::get<1>(t);
+                    }
+                }
+                auto toUSDT = [&](const std::string& asset, double amount)->double{
+                    if (amount <= 0.0) return 0.0;
+                    if (asset == "USDT") return amount;
+                    if (asset == "BUSD" || asset == "USDC") return amount; // assume near-par
+                    if (asset == "BNB") {
+                        double px = g_bnbUsdt.load(std::memory_order_relaxed);
+                        if (px <= 1.0 || px >= 2000.0) return 0.0; // guard bad ticks
+                        return amount * px;
+                    }
+                    return 0.0;
+                };
+                for (const auto &sym : fetchSyms) {
+                    try {
+                        auto rTrades = rest.getUserTrades(sym, 500, 5000);
+                        using nlohmann::json; auto jt = json::parse(rTrades.body, nullptr, false);
+                        if (jt.is_array()) {
+                            struct T { bool buy; double qty; double comm; std::string asset; };
+                            std::vector<T> trades; trades.reserve(jt.size());
+                            auto getd=[&](const nlohmann::json& v)->double{ if (v.is_string()) return std::stod(v.get<std::string>()); else if (v.is_number()) return v.get<double>(); else return 0.0; };
+                            for (auto &e : jt) {
+                                bool buyer=false; if (e.contains("isBuyer") && e["isBuyer"].is_boolean()) buyer=e["isBuyer"].get<bool>(); else if (e.contains("buyer") && e["buyer"].is_boolean()) buyer=e["buyer"].get<bool>();
+                                double q = e.contains("qty")? getd(e["qty"]) : 0.0;
+                                double c = e.contains("commission")? getd(e["commission"]) : 0.0;
+                                std::string a = e.value("commissionAsset", "");
+                                trades.push_back(T{buyer,q,c,a});
+                            }
+                            double posAmt = 0.0; auto itp = posAmtSnap.find(sym); if (itp!=posAmtSnap.end()) posAmt = itp->second;
+                            double need = std::abs(posAmt);
+                            double feeSum = 0.0;
+                            if (need > 1e-12) {
+                                for (int i=(int)trades.size()-1; i>=0 && need>1e-12; --i) {
+                                    const auto &tr = trades[i];
+                                    bool contributes = (posAmt>0 && tr.buy) || (posAmt<0 && !tr.buy);
+                                    if (!contributes || tr.qty <= 0.0) continue;
+                                    double useQty = std::min(need, tr.qty);
+                                    double frac = std::max(0.0, std::min(1.0, useQty / tr.qty));
+                                    feeSum += toUSDT(tr.asset, tr.comm * frac);
+                                    need -= useQty;
+                                }
+                            }
+                            {
+                                std::lock_guard<std::mutex> fk(g_feeMx);
+                                g_feeSpentBySymbolUSDT[sym] = feeSum;
+                            }
+                        }
+                    } catch (...) {}
+                }
+
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        } catch (...) {}
+    }).detach();
+}
+
+static void StartBnbTickerPollerOnce() {
+    static bool started = false; if (started) return; started = true;
+    std::thread([]{
+        try {
+            BinanceRest rest("fapi.binance.com"); rest.setInsecureTLS(false);
+            for (;;) {
+                auto r = rest.getTickerPrice("BNBUSDT");
+                try {
+                    using nlohmann::json; auto j = json::parse(r.body, nullptr, false);
+                    double px = 0.0; if (j.is_object()) {
+                        if (j.contains("price")) {
+                            if (j["price"].is_string()) px = std::stod(j["price"].get<std::string>());
+                            else if (j["price"].is_number()) px = j["price"].get<double>();
+                        }
+                    }
+                    // Clamp + light smoothing to prevent bad ticks corrupting fee conversion
+                    if (px > 1.0 && px < 2000.0) {
+                        double prev = g_bnbUsdt.load(std::memory_order_relaxed);
+                        double sm = (prev > 0.0) ? (prev * 0.75 + px * 0.25) : px;
+                        g_bnbUsdt.store(sm, std::memory_order_relaxed);
+                    }
+                } catch (...) {}
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+            }
+        } catch (...) {}
+    }).detach();
+}
 
 // Worker: connect and receive messages from Binance
 static void receiveOrderBook(const std::string& host, const std::string& port, int id) {
@@ -452,6 +613,32 @@ static void RenderOrderBookUI()
                             {
                                 std::lock_guard<std::mutex> gk(g_posOverlayMutex);
                                 g_posOverlay.swap(ov);
+                            }
+                            // Update open position symbols and reset fee tracking for closed symbols
+                            {
+                                std::set<std::string> curOpen;
+                                for (auto &t2 : s_positions) { curOpen.insert(std::get<0>(t2)); }
+                                std::set<std::string> prevOpen;
+                                {
+                                    std::lock_guard<std::mutex> lk(g_openSymbolsMx);
+                                    prevOpen = g_openPosSymbols;
+                                    g_openPosSymbols = curOpen;
+                                }
+                                // Rebuild leverage lookup for overlays
+                                {
+                                    std::lock_guard<std::mutex> lk2(g_levMx);
+                                    g_leverageBySymbol.clear();
+                                    for (auto &t2 : s_positions) {
+                                        g_leverageBySymbol[std::get<0>(t2)] = std::get<3>(t2);
+                                    }
+                                }
+                                for (const auto &sym2 : prevOpen) {
+                                    if (curOpen.find(sym2) == curOpen.end()) {
+                                        std::lock_guard<std::mutex> fk(g_feeMx);
+                                        g_feeSpentBySymbolUSDT.erase(sym2);
+                                        g_seenTradeIdsBySymbol.erase(sym2);
+                                    }
+                                }
                             }
                         } catch (...) {}
                     }
@@ -859,6 +1046,10 @@ static void RenderOrderBookUI()
                                     }
                                 }
                                 s_priceTick = tick; s_qtyStep = step; s_minQty = minq;
+                                // Mirror globally for chart interactions
+                                g_priceTick.store(s_priceTick, std::memory_order_relaxed);
+                                g_qtyStep.store(s_qtyStep, std::memory_order_relaxed);
+                                g_minQty.store(s_minQty, std::memory_order_relaxed);
                                 s_filtersMsg = "Loaded filters: tick=" + std::to_string(s_priceTick) + ", step=" + std::to_string(s_qtyStep) + ", minQty=" + std::to_string(s_minQty);
                             }
                         }
@@ -1060,8 +1251,8 @@ static void RenderOrderBookUI()
             bool doSend = !confirmBeforeSend;
             if (ImGui::BeginPopupModal("ConfirmOrder", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
                 ImGui::Text("%s %s %.6f @ %.2f", side.c_str(), sym, qQty, (orderTypeIdx==1? qPrice : (orderTypeIdx==0? (float)mid : qStop)));
-                if (ImGui::Button("확인", ImVec2(120,0))) { doSend = true; ImGui::CloseCurrentPopup(); }
-                ImGui::SameLine(); if (ImGui::Button("취소", ImVec2(120,0))) { doSend = false; ImGui::CloseCurrentPopup(); }
+                if (ImGui::Button("Confirm", ImVec2(120,0))) { doSend = true; ImGui::CloseCurrentPopup(); }
+                ImGui::SameLine(); if (ImGui::Button("Cancel", ImVec2(120,0))) { doSend = false; ImGui::CloseCurrentPopup(); }
                 ImGui::EndPopup();
             }
             if (doSend) {
@@ -1259,12 +1450,14 @@ static void RenderOrderBookUI()
         }
         if (ImGui::BeginTabBar("PosTabs")) {
             if (ImGui::BeginTabItem("Positions")) {
-                // Summary profit/loss split (compute from live mark for real-time feel)
-                double totalP=0.0, totalL=0.0;
+                // Summary PNL and ROI (position-based, not wallet)
+                double totalRaw=0.0, totalMarginUsed=0.0, totalFee=0.0;
+                std::unordered_map<std::string,double> feeSnap; { std::lock_guard<std::mutex> fk(g_feeMx); feeSnap = g_feeSpentBySymbolUSDT; }
                 for (auto& t : pos_local) {
                     const std::string& ps = std::get<0>(t);
                     double amt = std::get<1>(t);
                     double entry = std::get<2>(t);
+                    double lev = (double)std::get<3>(t);
                     double refMark = std::get<7>(t);
                     if (ps == g_chartSymbol && g_lastTradePrice.load() > 0.0) refMark = g_lastTradePrice.load();
                     if (refMark <= 0.0) {
@@ -1274,29 +1467,27 @@ static void RenderOrderBookUI()
                         refMark = (ask>0 && bid>0) ? (ask+bid)/2.0 : (ask>0?ask:bid);
                     }
                     double raw = amt * (refMark - entry);
-                    double openFee = std::abs(amt) * entry * s_takerRate;
-                    double closeFee = std::abs(amt) * refMark * s_takerRate;
-                    double pnl = raw - openFee - closeFee;
-                    if (pnl >= 0) totalP += pnl; else totalL += pnl; // totalL negative sum
+                    totalRaw += raw;
+                    double used = (lev>1e-12)? (std::abs(amt) * entry) / lev : 0.0;
+                    totalMarginUsed += used;
+                    auto it = feeSnap.find(ps); if (it != feeSnap.end()) totalFee += it->second;
                 }
-                double net = totalP + totalL;
-                ImGui::TextColored(ImVec4(0.2f,0.9f,0.5f,1.0f), "Profit:  %.2f USDT", totalP);
-                ImGui::SameLine(); ImGui::TextColored(ImVec4(1.0f,0.4f,0.4f,1.0f), "Loss:  %.2f USDT", totalL);
-                ImGui::SameLine(); ImGui::TextColored(net>=0?ImVec4(0.2f,0.9f,0.5f,1.0f):ImVec4(1.0f,0.4f,0.4f,1.0f), "Net:  %.2f USDT", net);
-                // Wallet-based Net% (use margin balance, fallback to available)
-                double baseWalletSum = (s_marginBalanceUSDT > 1e-12) ? s_marginBalanceUSDT : ((s_availableUSDT > 1e-12) ? s_availableUSDT : 0.0);
-                double netPctSum = (baseWalletSum > 1e-12) ? (net / baseWalletSum) * 100.0 : 0.0;
-                ImGui::SameLine(); ImGui::TextColored(net>=0?ImVec4(0.2f,0.9f,0.5f,1.0f):ImVec4(1.0f,0.4f,0.4f,1.0f), "Net%%:  %.2f%%", netPctSum);
+                double roiTotal = (totalMarginUsed>1e-12)? (totalRaw / totalMarginUsed) * 100.0 : 0.0;
+                ImVec4 netCol = totalRaw>=0? ImVec4(0.2f,0.9f,0.5f,1.0f) : ImVec4(1.0f,0.4f,0.4f,1.0f);
+                ImGui::TextColored(netCol, "Total PNL: %+0.2f USDT (ROI %.2f%%)", totalRaw, roiTotal);
+                ImGui::SameLine(); ImGui::Text("Fee: %.2f USDT", totalFee);
+                ImGui::SameLine(); ImGui::TextColored(netCol, "Net: %+0.2f USDT", totalRaw - totalFee);
 
-                if (ImGui::BeginTable("PositionsTable", 9, ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders|ImGuiTableFlags_SizingStretchProp)) {
+                if (ImGui::BeginTable("PositionsTable", 10, ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders|ImGuiTableFlags_SizingStretchProp)) {
                     ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthFixed, 100.0f);
                     ImGui::TableSetupColumn("Side", ImGuiTableColumnFlags_WidthFixed, 60.0f);
                     ImGui::TableSetupColumn("Qty", ImGuiTableColumnFlags_WidthStretch);
                     ImGui::TableSetupColumn("Entry", ImGuiTableColumnFlags_WidthStretch);
                     ImGui::TableSetupColumn("Lev", ImGuiTableColumnFlags_WidthFixed, 50.0f);
-                    ImGui::TableSetupColumn("PnL(fee)", ImGuiTableColumnFlags_WidthStretch);
-                    ImGui::TableSetupColumn("PnL%(wallet)", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-                    ImGui::TableSetupColumn("Margin", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                    ImGui::TableSetupColumn("PNL(ROI %)", ImGuiTableColumnFlags_WidthStretch);
+                    ImGui::TableSetupColumn("Fee (USDT)", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                    ImGui::TableSetupColumn("UsedMargin", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                    ImGui::TableSetupColumn("MarginType", ImGuiTableColumnFlags_WidthFixed, 90.0f);
                     ImGui::TableSetupColumn("Rate", ImGuiTableColumnFlags_WidthFixed, 80.0f);
                     ImGui::TableHeadersRow();
             for (auto& t : pos_local) {
@@ -1315,7 +1506,7 @@ static void RenderOrderBookUI()
                 ImGui::TableSetColumnIndex(2); ImGui::Text("%.6f", amt);
                 ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", entry);
                 ImGui::TableSetColumnIndex(4); ImGui::Text("%d", lev);
-                // Fee-adjusted PnL: compute from live mark for real-time display
+                // Position-based PNL (no floating fee): compute from live mark
                 double refMark = mark;
                 // Prefer ultra-realtime last price for current chart symbol
                 if (psymbol == g_chartSymbol && g_lastTradePrice.load() > 0.0) {
@@ -1328,18 +1519,21 @@ static void RenderOrderBookUI()
                     refMark = (ask>0 && bid>0) ? (ask+bid)/2.0 : (ask>0?ask:bid);
                 }
                 double raw = amt * (refMark - entry);
-                double openFee = std::abs(amt) * entry * s_takerRate;
-                double closeFee = std::abs(amt) * refMark * s_takerRate;
-                double pnlFee = raw - openFee - closeFee;
-                // Wallet-based PnL percent (use margin balance, fallback to available)
-                double baseWallet = (s_marginBalanceUSDT > 1e-12) ? s_marginBalanceUSDT : ((s_availableUSDT > 1e-12) ? s_availableUSDT : 0.0);
-                double pnlPct = (baseWallet > 1e-12) ? (pnlFee / baseWallet) * 100.0 : 0.0;
-                ImVec4 pnlCol = pnlFee >= 0 ? ImVec4(0.2f,0.9f,0.5f,1.0f) : ImVec4(1.0f,0.4f,0.4f,1.0f);
-                ImGui::TableSetColumnIndex(5); ImGui::TextColored(pnlCol, "%.2f", pnlFee);
-                ImGui::TableSetColumnIndex(6); ImGui::TextColored(pnlCol, "%.2f%%", pnlPct);
-                ImGui::TableSetColumnIndex(7); ImGui::TextUnformatted(mtype.c_str());
-                ImGui::TableSetColumnIndex(8); ImGui::Text("T%.4f%%", s_takerRate*100.0);
-            }
+                double usedMargin = (lev>0)? (std::abs(amt) * entry) / (double)lev : 0.0;
+                double roi = (usedMargin>1e-12)? (raw / usedMargin) * 100.0 : 0.0;
+                ImVec4 pnlCol = raw >= 0 ? ImVec4(0.2f,0.9f,0.5f,1.0f) : ImVec4(1.0f,0.4f,0.4f,1.0f);
+                ImGui::TableSetColumnIndex(5); ImGui::TextColored(pnlCol, "%+0.2f USDT (%.2f%%)", raw, roi);
+                // Fee spent (cumulative) per symbol
+                ImGui::TableSetColumnIndex(6);
+                double feeUsdt = 0.0; { std::lock_guard<std::mutex> fk(g_feeMx); auto it = g_feeSpentBySymbolUSDT.find(psymbol); if (it!=g_feeSpentBySymbolUSDT.end()) feeUsdt = it->second; }
+                ImGui::Text("%.4f", feeUsdt);
+                // Used margin (notional/leverage)
+                ImGui::TableSetColumnIndex(7);
+                ImGui::Text("%.2f", usedMargin);
+                // Margin type and rate
+                ImGui::TableSetColumnIndex(8); ImGui::TextUnformatted(mtype.c_str());
+                ImGui::TableSetColumnIndex(9); ImGui::Text("T%.4f%%", s_takerRate*100.0);
+                    }
                     ImGui::EndTable();
                 }
                 ImGui::EndTabItem();
@@ -1402,12 +1596,36 @@ static void RenderOrderBookUI()
                         ImGui::TableSetColumnIndex(8); ImGui::TextUnformatted(x.reduceOnly?"RO":"");
                         // Context menu per row
                         ImGui::PushID((int)i);
-                        if (ImGui::BeginPopupContextItem("oo_ctx")) {
+            if (ImGui::BeginPopupContextItem("oo_ctx")) {
                             if (ImGui::MenuItem("Cancel")) {
-                                if (s_rest) { auto r = s_rest->cancelOrder(g_chartSymbol, x.id, "", 5000); t_lastOrderResp = std::string("Cancel ")+std::to_string(x.id)+": "+(r.ok?"OK ":"ERR ")+std::to_string(r.status)+"\n"+r.body; auto r2=s_rest->getOpenOrders(g_chartSymbol,5000); std::lock_guard<std::mutex> lk(g_ordersMx); g_lastStatusOO.store(r2.status, std::memory_order_relaxed); g_openOrdersBody=r2.body; }
+                                if (s_rest) {
+                                    long long oid = x.id;
+                                    std::thread([oid]{
+                                        try {
+                                            if (!s_rest) return;
+                                            auto r = s_rest->cancelOrder(g_chartSymbol, oid, "", 5000);
+                                            std::cout << "[REST] Cancel order #" << oid << ": status=" << r.status << " ok=" << (r.ok?"true":"false") << "\n" << r.body << std::endl;
+                                            auto r2 = s_rest->getOpenOrders(g_chartSymbol,5000);
+                                            std::lock_guard<std::mutex> lk(g_ordersMx);
+                                            g_lastStatusOO.store(r2.status, std::memory_order_relaxed);
+                                            g_openOrdersBody = r2.body;
+                                        } catch(...){}
+                                    }).detach();
+                                }
                             }
                             if (ImGui::MenuItem("Cancel ALL (symbol)")) {
-                                if (s_rest) { auto r = s_rest->cancelAllOpenOrders(g_chartSymbol, 5000); t_lastOrderResp = std::string("CancelAll ")+g_chartSymbol+": "+(r.ok?"OK ":"ERR ")+std::to_string(r.status)+"\n"+r.body; auto r2=s_rest->getOpenOrders(g_chartSymbol,5000); std::lock_guard<std::mutex> lk(g_ordersMx); g_lastStatusOO.store(r2.status, std::memory_order_relaxed); g_openOrdersBody=r2.body; }
+                                if (s_rest) {
+                                    std::thread([]{
+                                        try {
+                                            auto r = s_rest->cancelAllOpenOrders(g_chartSymbol, 5000);
+                                            std::cout << "[REST] Cancel ALL (" << g_chartSymbol << ") status=" << r.status << " ok=" << (r.ok?"true":"false") << "\n" << r.body << std::endl;
+                                            auto r2=s_rest->getOpenOrders(g_chartSymbol,5000);
+                                            std::lock_guard<std::mutex> lk(g_ordersMx);
+                                            g_lastStatusOO.store(r2.status, std::memory_order_relaxed);
+                                            g_openOrdersBody=r2.body;
+                                        } catch(...){}
+                                    }).detach();
+                                }
                             }
                             if (ImGui::MenuItem("Duplicate as LIMIT")) {
                                 snprintf(t_sym, sizeof(t_sym), "%s", g_chartSymbol.c_str());
@@ -1716,30 +1934,10 @@ static void RenderChartWindow()
         }
     }
 
-    // Background poller: Orders + Fills auto-refresh every 1s (always on)
-    static bool s_ordersPollerStarted = false;
-    if (!s_ordersPollerStarted) {
-        s_ordersPollerStarted = true;
-        std::thread([]{
-            try {
-                BinanceRest rest("fapi.binance.com"); rest.setInsecureTLS(false);
-                for (;;) {
-                    std::string sym;
-                    { std::lock_guard<std::mutex> lk(g_chartSymbolMutex); sym = g_chartSymbol; }
-                    auto r1 = rest.getOpenOrders(sym, 5000);
-                    auto r2 = rest.getUserTrades(sym, 50, 5000);
-                    {
-                        std::lock_guard<std::mutex> lk(g_ordersMx);
-                        g_openOrdersBody = r1.body; g_lastStatusOO.store(r1.status, std::memory_order_relaxed);
-                        g_userTradesBody = r2.body; g_lastStatusUT.store(r2.status, std::memory_order_relaxed);
-                    }
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                }
-            } catch (...) { /* keep silent, thread restarts not handled */ }
-        }).detach();
-    }
+    // Background pollers are global (started from GuiMain)
     ImGui::SameLine(); ImGui::Checkbox("AutoUpdate", &g_chartLive); ImGui::SameLine(); ImGui::Checkbox("Crosshair", &showCross);
     ImGui::SameLine(); ImGui::Checkbox("Volume", &showVol); ImGui::SameLine(); ImGui::Checkbox("RSI", &showRSI); ImGui::SameLine(); ImGui::Checkbox("MACD", &showMACD); ImGui::SameLine(); ImGui::Checkbox("SMA", &showSMA);
+    static bool showDepth = true; ImGui::SameLine(); ImGui::Checkbox("Depth", &showDepth);
     if (showSMA) {
         ImGui::SameLine(); ImGui::SetNextItemWidth(90); ImGui::InputInt("S1", &sma1);
         ImGui::SameLine(); ImGui::SetNextItemWidth(90); ImGui::InputInt("S2", &sma2);
@@ -1789,6 +1987,154 @@ static void RenderChartWindow()
         auto p_to_y = [&](double p){ double a = (p - s_viewPmin) / (s_viewPmax - s_viewPmin); return p1.y - (float)(a * (p1.y - p0.y)); };
         auto y_to_p = [&](float y){ double a = (p1.y - y) / std::max(1.0f, (p1.y - p0.y)); return s_viewPmin + a * (s_viewPmax - s_viewPmin); };
 
+        // Shift + drag selection over chart: aggregate orderbook qty/avg within price range
+        static bool s_chartSelActive = false;          // currently dragging selection with Shift
+        static bool s_chartSelEditing = false;         // moving/resizing persistent selection
+        static ImVec2 s_chartSelStart{}, s_chartSelEnd{};
+        ImGuiIO& io = ImGui::GetIO();
+        bool chartHovered = ImGui::IsMouseHoveringRect(p0, p1);
+        if (chartHovered && io.KeyShift && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            s_chartSelActive = true; s_chartSelStart = io.MousePos; s_chartSelEnd = s_chartSelStart;
+        }
+        static bool s_chartSelHas = false; static double s_chartSelLow=0.0, s_chartSelHigh=0.0; static ImVec2 s_chartSelBoxA{}, s_chartSelBoxB{};
+        if (s_chartSelActive) {
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left) && io.KeyShift) {
+                s_chartSelEnd = io.MousePos;
+            } else {
+                s_chartSelActive = false; // release ends selection
+                // Persist selection range
+                ImVec2 a = s_chartSelStart, b = s_chartSelEnd; if (a.y>b.y) std::swap(a,b);
+                a.x = p0.x; b.x = p1.x; a.y = std::max(a.y, p0.y); b.y = std::min(b.y, p1.y);
+                double pLow = y_to_p(b.y); double pHigh = y_to_p(a.y); if (pLow>pHigh) std::swap(pLow,pHigh);
+                s_chartSelHas = true; s_chartSelLow = pLow; s_chartSelHigh = pHigh; s_chartSelBoxA=a; s_chartSelBoxB=b;
+            }
+            // Draw selection rectangle clipped to chart area (foreground, thinner lines)
+            ImVec2 a = s_chartSelStart, b = s_chartSelEnd; if (a.y>b.y) std::swap(a,b);
+            a.x = p0.x; b.x = p1.x; // full width band for clarity
+            a.y = std::max(a.y, p0.y); b.y = std::min(b.y, p1.y);
+            ImDrawList* fg = ImGui::GetForegroundDrawList();
+            fg->AddRectFilled(a, b, IM_COL32(90, 140, 230, 22));
+            fg->AddRect(a, b, IM_COL32(120, 170, 255, 180), 1.0f);
+            // thin guide lines
+            fg->AddLine(ImVec2(a.x, a.y), ImVec2(b.x, a.y), IM_COL32(120,180,255,160), 1.0f);
+            fg->AddLine(ImVec2(a.x, b.y), ImVec2(b.x, b.y), IM_COL32(120,180,255,160), 1.0f);
+
+            // Compute price range from y
+            double pLow = y_to_p(b.y);
+            double pHigh = y_to_p(a.y);
+            if (pLow > pHigh) std::swap(pLow, pHigh);
+            // Aggregate order book across bids+asks (use current maps)
+            double sumQty = 0.0, sumPQ = 0.0; int rows = 0;
+            {
+                std::lock_guard<std::mutex> lk(bookMutex);
+                for (auto it = g_bookBids.lower_bound(pLow); it != g_bookBids.end() && it->first <= pHigh; ++it) {
+                    double q = std::max(0.0, it->second); if (q<=0) continue; sumQty += q; sumPQ += it->first * q; rows++;
+                }
+                for (auto it = g_bookAsks.lower_bound(pLow); it != g_bookAsks.end() && it->first <= pHigh; ++it) {
+                    double q = std::max(0.0, it->second); if (q<=0) continue; sumQty += q; sumPQ += it->first * q; rows++;
+                }
+            }
+            double avgP = (sumQty > 1e-12) ? (sumPQ / sumQty) : 0.0;
+            double notional = sumPQ;
+            double takerFee = notional * g_takerRate.load(std::memory_order_relaxed);
+            double makerFee = notional * g_makerRate.load(std::memory_order_relaxed);
+            // Overlay info box with high-contrast labels (foreground)
+            auto draw_info = [&](double lo,double hi,int r,double qty,double avg,double /*notion*/,double /*ft*/,double /*fm*/, float yAnchor){
+                char line1[128],line2[128];
+                snprintf(line1,sizeof(line1),"Range  %.2f ~ %.2f", lo, hi);
+                snprintf(line2,sizeof(line2),"Rows %d   Avg %.2f", r, avg);
+                ImVec2 s1=ImGui::CalcTextSize(line1), s2=ImGui::CalcTextSize(line2);
+                // Emphasize Qty as headline
+                char qtyLine[64]; snprintf(qtyLine,sizeof(qtyLine),"Qty %.6f", qty);
+                float qtySize = ImGui::GetFontSize() * 1.6f;
+                ImVec2 sq = ImGui::CalcTextSize(qtyLine); sq.x *= 1.6f; sq.y *= 1.2f; // rough upscale bounds
+                float w = std::max({s1.x,s2.x,sq.x}); float h = sq.y + s1.y + s2.y + 12.0f;
+                // Position to left side for better visibility
+                ImVec2 bx0 = ImVec2(p0.x + 8.0f, yAnchor - h - 8.0f); if (bx0.y < p0.y) bx0.y = p0.y + 6.0f;
+                ImVec2 bx1 = ImVec2(bx0.x + w + 16.0f, bx0.y + h + 6.0f);
+                fg->AddRectFilled(bx0, bx1, IM_COL32(16,20,26,245), 6.0f);
+                fg->AddRectFilled(ImVec2(bx0.x, bx0.y), ImVec2(bx0.x+4, bx1.y), IM_COL32(100,180,255,255));
+                ImU32 cLabel = IM_COL32(170,200,255,255);
+                ImU32 cValue = IM_COL32(240,240,245,255);
+                // Qty big
+                fg->AddText(ImGui::GetFont(), qtySize, ImVec2(bx0.x + 8.0f, bx0.y + 4.0f), IM_COL32(255,240,160,255), qtyLine);
+                // Range / Avg lines
+                float yoff = (bx0.y + 4.0f) + sq.y + 2.0f;
+                fg->AddText(ImVec2(bx0.x + 8.0f, yoff), cLabel, "Range"); fg->AddText(ImVec2(bx0.x + 66.0f, yoff), cValue, line1+7);
+                yoff += s1.y;
+                fg->AddText(ImVec2(bx0.x + 8.0f, yoff), cLabel, "Avg"); fg->AddText(ImVec2(bx0.x + 66.0f, yoff), cValue, line2+5);
+            };
+            draw_info(pLow,pHigh,rows,sumQty,avgP,notional,takerFee,makerFee,a.y);
+        }
+        // Persistent overlay after drag ends
+        if (!s_chartSelActive && s_chartSelHas) {
+            // Draw band and border
+            ImVec2 a = s_chartSelBoxA, b = s_chartSelBoxB; // original band extents
+            // Recompute y from prices to keep in sync with zoom/pan
+            float y0 = p_to_y(s_chartSelHigh); float y1 = p_to_y(s_chartSelLow);
+            if (y0 > y1) std::swap(y0,y1);
+            a.y = std::max(y0, p0.y); b.y = std::min(y1, p1.y); a.x = p0.x; b.x = p1.x;
+            ImDrawList* fg = ImGui::GetForegroundDrawList();
+            fg->AddRectFilled(a, b, IM_COL32(90, 140, 230, 22));
+            fg->AddRect(a, b, IM_COL32(120, 170, 255, 255), 1.0f);
+            fg->AddLine(ImVec2(a.x, a.y), ImVec2(b.x, a.y), IM_COL32(120,180,255,200), 1.0f);
+            fg->AddLine(ImVec2(a.x, b.y), ImVec2(b.x, b.y), IM_COL32(120,180,255,200), 1.0f);
+            // Interactive move/resize handles
+            ImGuiIO& io4 = ImGui::GetIO(); ImVec2 mp = io4.MousePos;
+            const float grip = 6.0f;
+            bool overTop = (mp.y >= a.y - grip && mp.y <= a.y + grip && mp.x >= a.x && mp.x <= b.x);
+            bool overBot = (mp.y >= b.y - grip && mp.y <= b.y + grip && mp.x >= a.x && mp.x <= b.x);
+            bool inside  = (mp.y > a.y + grip && mp.y < b.y - grip && mp.x >= a.x && mp.x <= b.x);
+            static bool s_rsTop=false, s_rsBot=false, s_dragBand=false; static float yStart=0.0f; static double lowStart=0.0, highStart=0.0;
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { yStart=mp.y; lowStart=s_chartSelLow; highStart=s_chartSelHigh; s_rsTop=overTop; s_rsBot=overBot; s_dragBand=inside && !overTop && !overBot; }
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left) && (s_rsTop||s_rsBot||s_dragBand)) {
+                s_chartSelEditing = true; // block other drags while editing selection
+                if (s_rsTop) { float ny = std::max(p0.y, std::min(mp.y, b.y - 2.0f*grip)); s_chartSelHigh = std::max(s_chartSelLow, y_to_p(ny)); }
+                else if (s_rsBot) { float ny = std::min(p1.y, std::max(mp.y, a.y + 2.0f*grip)); s_chartSelLow = std::min(s_chartSelHigh, y_to_p(ny)); }
+                else if (s_dragBand) {
+                    float dy = mp.y - yStart; double dP = (double)dy / std::max(1.0f,(p1.y - p0.y)) * (s_viewPmax - s_viewPmin);
+                    s_chartSelLow = lowStart - dP; s_chartSelHigh = highStart - dP;
+                }
+            }
+            if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) { s_rsTop=s_rsBot=s_dragBand=false; s_chartSelEditing=false; }
+            // Draw grips
+            fg->AddRectFilled(ImVec2(a.x, a.y - 1), ImVec2(b.x, a.y + 1), IM_COL32(120,180,255,220));
+            fg->AddRectFilled(ImVec2(a.x, b.y - 1), ImVec2(b.x, b.y + 1), IM_COL32(120,180,255,220));
+            // Aggregate live again for up-to-date info
+            double sumQty = 0.0, sumPQ = 0.0; int rows = 0;
+            {
+                std::lock_guard<std::mutex> lk(bookMutex);
+                for (auto it = g_bookBids.lower_bound(s_chartSelLow); it != g_bookBids.end() && it->first <= s_chartSelHigh; ++it) { double q = std::max(0.0, it->second); if (q<=0) continue; sumQty += q; sumPQ += it->first * q; rows++; }
+                for (auto it = g_bookAsks.lower_bound(s_chartSelLow); it != g_bookAsks.end() && it->first <= s_chartSelHigh; ++it) { double q = std::max(0.0, it->second); if (q<=0) continue; sumQty += q; sumPQ += it->first * q; rows++; }
+            }
+            double avgP = (sumQty > 1e-12) ? (sumPQ / sumQty) : 0.0;
+            double notional = sumPQ;
+            // Info box with accent
+            auto draw_info2 = [&](float yAnchor){
+                char line1[128],line2[128];
+                snprintf(line1,sizeof(line1),"Range  %.2f ~ %.2f", s_chartSelLow, s_chartSelHigh);
+                snprintf(line2,sizeof(line2),"Rows %d   Avg %.2f", rows, avgP);
+                ImVec2 s1=ImGui::CalcTextSize(line1), s2=ImGui::CalcTextSize(line2);
+                char qtyLine[64]; snprintf(qtyLine,sizeof(qtyLine),"Qty %.6f", sumQty);
+                float qtySize = ImGui::GetFontSize() * 1.6f;
+                ImVec2 sq = ImGui::CalcTextSize(qtyLine); sq.x *= 1.6f; sq.y *= 1.2f;
+                float w = std::max({s1.x,s2.x,sq.x}); float h = sq.y + s1.y + s2.y + 12.0f;
+                ImVec2 bx0 = ImVec2(p0.x + 8.0f, yAnchor - h - 8.0f); if (bx0.y < p0.y) bx0.y = p0.y + 6.0f;
+                ImVec2 bx1 = ImVec2(bx0.x + w + 16.0f, bx0.y + h + 6.0f);
+                fg->AddRectFilled(bx0, bx1, IM_COL32(16,20,26,245), 6.0f);
+                fg->AddRectFilled(ImVec2(bx0.x, bx0.y), ImVec2(bx0.x+4, bx1.y), IM_COL32(100,180,255,255));
+                ImU32 cLabel = IM_COL32(170,200,255,255); ImU32 cValue = IM_COL32(240,240,245,255);
+                fg->AddText(ImGui::GetFont(), qtySize, ImVec2(bx0.x + 8.0f, bx0.y + 4.0f), IM_COL32(255,240,160,255), qtyLine);
+                float yoff = (bx0.y + 4.0f) + sq.y + 2.0f;
+                fg->AddText(ImVec2(bx0.x + 8.0f, yoff), cLabel, "Range"); fg->AddText(ImVec2(bx0.x + 66.0f, yoff), cValue, line1+7);
+                yoff += s1.y;
+                fg->AddText(ImVec2(bx0.x + 8.0f, yoff), cLabel, "Avg"); fg->AddText(ImVec2(bx0.x + 66.0f, yoff), cValue, line2+5);
+            };
+            draw_info2(a.y);
+            // Dismiss on Esc
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) s_chartSelHas = false;
+        }
+
         // A toggle button FIRST so it gets input priority over the chart-area listener
         {
             bool autoMode = !s_priceManual;
@@ -1802,6 +2148,124 @@ static void RenderChartWindow()
             ImGui::PopStyleColor(3);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Auto Price Scale");
         }
+
+        // In-chart interactive: open orders drag + crosshair '+' button
+        // Pause other drags while Shift selecting or editing selection
+        bool s_disableInteractions = false; // transient per-frame flag
+        {
+            ImGuiIO& io3 = ImGui::GetIO();
+            if ((io3.KeyShift && ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::IsMouseHoveringRect(p0, p1)) || s_chartSelEditing)
+                s_disableInteractions = true;
+        }
+        static std::unique_ptr<BinanceRest> s_restChart(new BinanceRest("fapi.binance.com"));
+        if (s_restChart) s_restChart->setInsecureTLS(false);
+        // Helpers: refresh + lookup + wait for cancellation completion
+        auto refresh_open_orders = [&](){ if (s_disableInteractions) return; 
+            if (!s_restChart) return;
+            auto r2 = s_restChart->getOpenOrders(g_chartSymbol, 5000);
+            std::lock_guard<std::mutex> lk(g_ordersMx);
+            g_openOrdersBody = r2.body;
+            g_lastStatusOO.store(r2.status, std::memory_order_relaxed);
+        };
+        auto is_order_present = [&](long long oid)->bool{ if (s_disableInteractions) return false; 
+            std::string snapshot; { std::lock_guard<std::mutex> lk(g_ordersMx); snapshot = g_openOrdersBody; }
+            try{ using nlohmann::json; auto j=json::parse(snapshot,nullptr,false); if(j.is_array()){ for(auto &e:j){ if(e.contains("orderId") && e["orderId"].is_number_integer()){ long long id=e["orderId"].get<long long>(); if(id==oid) return true; } } } }catch(...){}
+            return false;
+        };
+        auto wait_cancelled = [&](long long oid,int timeoutMs)->bool{ if (s_disableInteractions) return false; 
+            using namespace std::chrono; auto t0=steady_clock::now();
+            for(;;){ refresh_open_orders(); if(!is_order_present(oid)) return true; std::this_thread::sleep_for(std::chrono::milliseconds(60)); if(duration_cast<milliseconds>(steady_clock::now()-t0).count()>timeoutMs) break; }
+            return false;
+        };
+        auto cancel_order_id = [&](long long oid)->bool{ if (s_disableInteractions) return false; 
+            if (!s_restChart || oid<=0) return false;
+            auto r = s_restChart->cancelOrder(g_chartSymbol, oid, "", 5000);
+            std::cout << "[REST] Cancel order #" << oid << ": status=" << r.status << " ok=" << (r.ok?"true":"false") << "\n" << r.body << std::endl;
+            refresh_open_orders();
+            return r.ok && r.status>=200 && r.status<300;
+        };
+        auto async_cancel = [&](long long oid){ if (s_disableInteractions) return; 
+            std::thread([=]{
+                try {
+                    if (!s_restChart) return;
+                    auto r = s_restChart->cancelOrder(g_chartSymbol, oid, "", 5000);
+                    std::cout << "[REST] Cancel order #" << oid << ": status=" << r.status << " ok=" << (r.ok?"true":"false") << "\n" << r.body << std::endl;
+                    refresh_open_orders();
+                } catch(...){}
+            }).detach();
+        };
+        auto async_cancel_replace = [&](long long oid, const std::string side, double qty, double newPrice, const std::string posSide, bool reduceOnly){ if (s_disableInteractions) return; 
+            std::thread([=]{
+                try {
+                    if (!s_restChart) return;
+                    // Round price to tick and qty to step for safety
+                    double tick = g_priceTick.load(std::memory_order_relaxed); if (tick <= 0.0) tick = 0.1;
+                    double step = g_qtyStep.load(std::memory_order_relaxed); if (step <= 0.0) step = 0.001;
+                    double pRounded = std::floor((newPrice + 1e-12) / tick) * tick;
+                    double qRounded = std::floor((qty + 1e-12) / step) * step;
+                    if (qRounded <= 0.0) return;
+
+                    auto r = s_restChart->cancelReplaceOrder(
+                        g_chartSymbol,
+                        oid,
+                        side,
+                        std::string("LIMIT"),
+                        qRounded,
+                        pRounded,
+                        std::string("GTC"),
+                        reduceOnly,
+                        posSide,
+                        std::string("STOP_ON_FAILURE"),
+                        5000);
+                    std::cout << "[REST] CancelReplace #" << oid << ": status=" << r.status << " ok=" << (r.ok?"true":"false") << "\n" << r.body << std::endl;
+                    if (!r.ok) {
+                        // Fallback: cancel then place
+                        auto rc = s_restChart->cancelOrder(g_chartSymbol, oid, "", 5000);
+                        std::cout << "[REST] Fallback Cancel #" << oid << ": status=" << rc.status << " ok=" << (rc.ok?"true":"false") << "\n" << rc.body << std::endl;
+                        if (rc.ok) {
+                            auto rp = s_restChart->placeOrder(g_chartSymbol, side, "LIMIT", qRounded, pRounded, "GTC", reduceOnly, false, 5000, posSide, 0.0, "MARK_PRICE");
+                            std::cout << "[REST] Fallback Place (" << side << ") status=" << rp.status << " ok=" << (rp.ok?"true":"false") << "\n" << rp.body << std::endl;
+                        }
+                    }
+                    refresh_open_orders();
+                } catch(...) {}
+            }).detach();
+        };
+        // Parse open orders snapshot once per frame
+        struct OO { long long id; std::string clientId; std::string side,type,status,pside; double price,origQty,executedQty; bool reduceOnly; };
+        std::vector<OO> oos;
+        {
+            std::string snapshot; { std::lock_guard<std::mutex> lk(g_ordersMx); snapshot = g_openOrdersBody; }
+            try {
+                using nlohmann::json; auto j = json::parse(snapshot, nullptr, false);
+                if (j.is_array()) {
+                    for (auto &e : j) {
+                        OO x{}; x.id = e.value("orderId", 0LL); x.clientId = e.value("clientOrderId", std::string(""));
+                        x.side = e.value("side", ""); x.type = e.value("type", ""); x.status = e.value("status", "");
+                        x.pside = e.value("positionSide", ""); x.reduceOnly = e.value("reduceOnly", false);
+                        auto getd=[&](const nlohmann::json& v)->double{ if (v.is_string()) return std::stod(v.get<std::string>()); else if(v.is_number()) return v.get<double>(); else return 0.0; };
+                        x.price = e.contains("price")? getd(e["price"]) : 0.0;
+                        x.origQty = e.contains("origQty")? getd(e["origQty"]) : 0.0;
+                        x.executedQty = e.contains("executedQty")? getd(e["executedQty"]) : 0.0;
+                        // Only current symbol
+                        // Note: endpoint already filtered by current symbol in poller
+                        oos.push_back(x);
+                    }
+                }
+            } catch(...) {}
+        }
+        // Drag state for order lines
+        static bool s_draggingOrder = false;
+        static long long s_dragOrderId = 0;
+        static double s_dragOrigPrice = 0.0;
+        static double s_dragNewPrice = 0.0;
+        static double s_dragQty = 0.0;
+        static std::string s_dragSide;
+        static std::string s_dragPosSide;
+        static bool s_dragReduceOnly = false;
+
+        // (Removed older duplicate interactive block to avoid double-handling and duplication)
+        // (moved) plus button is placed next to the crosshair price overlay.
 
         // Interaction: zoom/pan (placed AFTER A button so it doesn't steal clicks there)
         ImGui::InvisibleButton("chart_area", ImVec2(avail.x, chartH));
@@ -1822,15 +2286,16 @@ static void RenderChartWindow()
             }
         }
         static ImVec2 dragStart; static long long v0_start=0, v1_start=0; static double prMinStart=0.0, prMaxStart=0.0; static bool dragOnAxis=false;
-        if (active && ImGui::IsMouseClicked(0)) { 
+        if (active && ImGui::IsMouseClicked(0) && !s_draggingOrder && !s_chartSelEditing) { 
             dragStart = ImGui::GetIO().MousePos; v0_start=viewT0; v1_start=viewT1; prMinStart = s_viewPmin; prMaxStart = s_viewPmax; 
             float axisLeft = p1.x - 60.0f; dragOnAxis = (dragStart.x >= axisLeft && dragStart.x <= p1.x);
             if (dragOnAxis && !s_priceManual) { s_priceManual = true; /* engage manual only on price-axis drag */ }
         }
-        if (active && ImGui::IsMouseDragging(0)) {
+        if (active && ImGui::IsMouseDragging(0) && !s_draggingOrder && !s_chartSelEditing) {
             ImVec2 cur = ImGui::GetIO().MousePos;
             ImVec2 d = ImVec2(cur.x - dragStart.x, cur.y - dragStart.y);
-            if (!dragOnAxis) {
+            // Block horizontal pan when Shift is held (selection mode)
+            if (!dragOnAxis && !ImGui::GetIO().KeyShift && !s_chartSelEditing) {
                 long long dt = (long long)((double)(v1_start - v0_start) * (d.x / std::max(1.0f,(p1.x - p0.x))));
                 viewT0 = v0_start - dt; viewT1 = v1_start - dt; clamp_view();
             }
@@ -1898,7 +2363,7 @@ static void RenderChartWindow()
         dl->AddRectFilled(ImVec2(p1.x - lps.x - 10, yLast - lps.y*0.5f - 2), ImVec2(p1.x - 2, yLast + lps.y*0.5f + 2), IM_COL32(40,40,10,230));
         dl->AddText(ImVec2(p1.x - lps.x - 6, yLast - lps.y*0.5f), IM_COL32(255,235,120,255), lp.c_str());
 
-        // Positions overlay: draw entry lines for current symbol, colored by live PnL
+        // Positions overlay: draw entry line and BE lines for taker/maker close
         {
             std::vector<std::tuple<std::string,double,double>> pos;
             {
@@ -1912,18 +2377,13 @@ static void RenderChartWindow()
                 double entry = std::get<2>(t);
                 if (entry <= 0.0 || std::abs(amt) < 1e-12) continue;
                 bool isLong = amt > 0;
-                // Fee-adjusted PnL and percent
-                double q = std::abs(amt);
-                double rfee = g_takerRate.load(std::memory_order_relaxed);
+                // Position-based PNL & ROI (no floating fee; ROI by used margin)
+                int levHere = 0; // leverage from global map
+                { std::lock_guard<std::mutex> lk(g_levMx); auto it = g_leverageBySymbol.find(ps); if (it!=g_leverageBySymbol.end()) levHere = it->second; }
                 double raw = amt * (lastC - entry);
-                double fees = q * entry * rfee + q * lastC * rfee; // taker open + taker close
-                double pnlFee = raw - fees;
-                // Wallet-based percent for overlay, consistent with Positions table
-                double mb = g_marginBalanceUSDT.load(std::memory_order_relaxed);
-                double av = g_availableUSDT.load(std::memory_order_relaxed);
-                double baseWallet = (mb > 1e-12) ? mb : ((av > 1e-12) ? av : 0.0);
-                double pnlPct = (baseWallet > 1e-12) ? (pnlFee / baseWallet) * 100.0 : 0.0;
-                // Color by raw PnL sign (직관적: 가격이 유리한 방향이면 초록/불리하면 빨강)
+                double usedMargin = (levHere>0)? (std::abs(amt) * entry) / (double)levHere : 0.0;
+                double roiPct = (usedMargin>1e-12)? (raw / usedMargin) * 100.0 : 0.0;
+                // Color by raw PnL sign (positive: green, negative: red)
                 ImU32 col = raw >= 0 ? IM_COL32(60,200,120,220) : IM_COL32(220,80,80,220);
                 float y = p_to_y(entry);
                 // dashed entry line across chart
@@ -1935,37 +2395,44 @@ static void RenderChartWindow()
                     double m = (lastC - entry) / entry * 100.0;
                     movePct = isLong ? m : -m;
                 }
-                char lab[256]; snprintf(lab, sizeof(lab), "%s  %.6f @ %.2f  Δ%.2f%%  PnL %.2f  (W%.2f%%)",
-                    isLong?"LONG":"SHORT", fabs(amt), entry, movePct, pnlFee, pnlPct);
+                char lab[256]; snprintf(lab, sizeof(lab), "%s  %.6f @ %.2f  d%.2f%%  PNL:%+.2f (ROI %.2f%%)",
+                    isLong?"LONG":"SHORT", fabs(amt), entry, movePct, raw, roiPct);
                 ImVec2 ts = ImGui::CalcTextSize(lab);
                 float lx = p0.x + 8.0f; float ly = y - ts.y - 2.0f; if (ly < p0.y) ly = p0.y + 2.0f; if (ly + ts.y + 4 > p1.y) ly = p1.y - (ts.y + 4);
                 dl->AddRectFilled(ImVec2(lx-3, ly-2), ImVec2(lx + ts.x + 4, ly + ts.y + 2), IM_COL32(18,18,20,210));
                 dl->AddText(ImVec2(lx, ly), col, lab);
 
-                // Break-even line (dotted), fee-inclusive
-                double bePrice = 0.0;
-                if (isLong) {
-                    double den = (1.0 - rfee); if (den > 1e-9) bePrice = entry * (1.0 + rfee) / den;
-                } else {
-                    double den = (1.0 + rfee); if (den > 1e-9) bePrice = entry * (1.0 - rfee) / den;
-                }
-                if (bePrice > 0.0) {
-                    float ybe = p_to_y(bePrice);
-                    // dashed line across chart
-                    float dash = 8.0f, gap = 6.0f; float x = p0.x;
-                    while (x < p1.x) {
-                        float x2 = std::min(p1.x, x + dash);
-                        dl->AddLine(ImVec2(x, ybe), ImVec2(x2, ybe), IM_COL32(200,200,200,140), 1.0f);
-                        x += dash + gap;
+                // Rates for break-even visualization
+                double rtaker = g_takerRate.load(std::memory_order_relaxed);
+                double rmaker = g_makerRate.load(std::memory_order_relaxed);
+
+                // Break-even lines with taker and maker close assumptions
+                // Get realized fee snapshot for this symbol (USDT)
+                double feeSpent = 0.0; { std::lock_guard<std::mutex> fk(g_feeMx); auto it = g_feeSpentBySymbolUSDT.find(ps); if (it!=g_feeSpentBySymbolUSDT.end()) feeSpent = it->second; }
+                // Break-even price using realized open fees + assumed close fee rate
+                // Long: q*(P-entry) - feeOpen - P*q*closeRate = 0  => P = (q*entry + feeOpen) / (q*(1-closeRate))
+                // Short: q*(entry-P) - feeOpen - P*q*closeRate = 0 => P = (q*entry - feeOpen) / (q*(1+closeRate))
+                auto draw_be = [&](double closeRate, ImU32 ccol, const char* tag){
+                    double be = 0.0; double q = std::abs(amt);
+                    if (isLong) {
+                        double den = q * (1.0 - closeRate);
+                        if (den > 1e-9) be = (q * entry + feeSpent) / den;
+                    } else {
+                        double den = q * (1.0 + closeRate);
+                        if (den > 1e-9) be = (q * entry - feeSpent) / den;
                     }
-                    // label with percent from entry
-                    double beFromEntryPct = (entry > 1e-12) ? ((bePrice - entry) / entry * 100.0) : 0.0;
-                    char bl[128]; snprintf(bl, sizeof(bl), "BE(fee) @ %.2f  %+0.2f%% from entry", bePrice, beFromEntryPct);
-                    ImVec2 bsz = ImGui::CalcTextSize(bl);
-                    float bx = p1.x - bsz.x - 8.0f; float by = ybe - bsz.y - 2.0f; if (by < p0.y) by = p0.y + 2.0f; if (by + bsz.y + 4 > p1.y) by = p1.y - (bsz.y + 4);
-                    dl->AddRectFilled(ImVec2(bx-3, by-2), ImVec2(bx + bsz.x + 4, by + bsz.y + 2), IM_COL32(18,18,20,190));
-                    dl->AddText(ImVec2(bx, by), IM_COL32(220,200,90,220), bl);
-                }
+                    if (be > 0.0) {
+                        float ybe = p_to_y(be); float dash2=8.0f,gap2=6.0f; float x=p0.x; while(x<p1.x){ float x2=std::min(p1.x, x+dash2); dl->AddLine(ImVec2(x,ybe),ImVec2(x2,ybe),ccol,1.2f); x+=dash2+gap2; }
+                        double dPct = (entry>1e-12)? ((be-entry)/entry*100.0) : 0.0;
+                        char bl[128]; snprintf(bl, sizeof(bl), "%s BE @ %.2f  %+0.2f%%", tag, be, dPct);
+                        ImVec2 bsz = ImGui::CalcTextSize(bl);
+                        float bx = p1.x - bsz.x - 8.0f; float by = ybe - bsz.y - 2.0f; if (by < p0.y) by = p0.y + 2.0f; if (by + bsz.y + 4 > p1.y) by = p1.y - (bsz.y + 4);
+                        dl->AddRectFilled(ImVec2(bx-3, by-2), ImVec2(bx + bsz.x + 4, by + bsz.y + 2), IM_COL32(18,18,20,180));
+                        dl->AddText(ImVec2(bx, by), ccol, bl);
+                    }
+                };
+                draw_be(rtaker, IM_COL32(220,220,200,180), "Close T");
+                draw_be(rmaker, IM_COL32(120,200,255,180), "Close M");
             }
         }
 
@@ -2309,6 +2776,152 @@ static void RenderChartWindow()
             draw_line_series(lower, IM_COL32(180,180,180,200));
         }
 
+        // Orderbook depth heatmap (faint gray bars near right axis)
+        if (showDepth) {
+            // Simple faint overlay near right axis with coarse bins (previous version)
+            double tick = g_priceTick.load(std::memory_order_relaxed); if (tick <= 0.0) tick = 0.1;
+            double viewMin = s_viewPmin, viewMax = s_viewPmax; if (viewMax <= viewMin) viewMax = viewMin + 1.0;
+            double bin = std::max(tick, (viewMax - viewMin) / 240.0); // ~240 bins max
+            std::map<double,double> binsAll, binsBid, binsAsk;
+            {
+                std::lock_guard<std::mutex> lk(bookMutex);
+                for (const auto& kv : g_bookBids) {
+                    double p = kv.first, q = kv.second; if (p < viewMin || p > viewMax || q <= 0.0) continue; double k = std::floor((p - viewMin) / bin) * bin + viewMin; binsBid[k] += q;
+                }
+                for (const auto& kv : g_bookAsks) {
+                    double p = kv.first, q = kv.second; if (p < viewMin || p > viewMax || q <= 0.0) continue; double k = std::floor((p - viewMin) / bin) * bin + viewMin; binsAsk[k] += q;
+                }
+                binsAll = binsBid; for (const auto& kv : binsAsk) { binsAll[kv.first] += kv.second; }
+            }
+            double maxq = 0.0; for (auto &kv : binsAll) if (kv.second > maxq) maxq = kv.second;
+            if (maxq > 0.0) {
+                float rightBand = 60.0f; // reserved price axis width
+                float xRight = p1.x - rightBand - 2.0f;
+                float maxW = 300.0f; // extend horizontal length further
+                for (auto &kv : binsAll) {
+                    double pA = kv.first; double pB = kv.first + bin;
+                    float y0 = p_to_y(pA), y1 = p_to_y(pB);
+                    float yt = std::min(y0, y1), yb = std::max(y0, y1);
+                    if (yb < p0.y || yt > p1.y) continue;
+                    float h = std::max(1.0f, yb - yt);
+                    double r = kv.second / maxq; if (r < 0.0) r = 0.0; if (r > 1.0) r = 1.0;
+                    double t = sqrt(r);
+                    float w = (float)(maxW * t);
+                    ImU32 col = IM_COL32(150,150,160, (int)(50 + 90 * t));
+                    dl->AddRectFilled(ImVec2(xRight - w, yt), ImVec2(xRight, yt + h), col);
+                }
+            }
+            // Color accents for best bid/ask as colored bars within depth lane
+            double bestBid=0.0, bestAsk=0.0; double bestBidQty=0.0, bestAskQty=0.0; {
+                std::lock_guard<std::mutex> lk(bookMutex);
+                if (!g_bookBids.empty()) { bestBid = g_bookBids.begin()->first; bestBidQty = g_bookBids.begin()->second; }
+                if (!g_bookAsks.empty()) { bestAsk = g_bookAsks.begin()->first; bestAskQty = g_bookAsks.begin()->second; }
+            }
+            if (bestBid > 0.0 || bestAsk > 0.0) {
+                const float maxBestW = 300.0f;
+                double ref = std::max(bestBidQty, bestAskQty); if (ref <= 0.0) ref = 1.0;
+                auto width_for_qty = [&](double q)->float{
+                    // Strict linear scale: preserve exact ratio between bid/ask sizes
+                    float w = (float)(maxBestW * std::max(0.0, q) / ref);
+                    return w;
+                };
+                float wBid = width_for_qty(bestBidQty);
+                float wAsk = width_for_qty(bestAskQty);
+                float yBid = bestBid>0.0? p_to_y(bestBid): 0.0f;
+                float yAsk = bestAsk>0.0? p_to_y(bestAsk): 0.0f;
+                // Use fixed pixel stripes to keep bid/ask separated even when zoomed out
+                float stripeH = 3.0f;
+                // Keep visual semantics stable: bottom = Bid(초록), top = Ask(빨강)
+                // Screen Y grows downward, so push Bid downward (+) and Ask upward (-) when too close.
+                if (bestBid>0.0 && bestAsk>0.0 && fabsf(yBid - yAsk) < stripeH + 1.0f) {
+                    yBid += stripeH * 0.7f; // move bid stripe toward bottom
+                    yAsk -= stripeH * 0.7f; // move ask stripe toward top
+                }
+                float xRight2 = p1.x - 60.0f - 2.0f;
+                if (bestBid > 0.0) {
+                    ImU32 colB = IM_COL32(60,200,150, 200);
+                    float y0 = std::max(p0.y, yBid - stripeH*0.5f), y1 = std::min(p1.y, yBid + stripeH*0.5f);
+                    dl->AddRectFilled(ImVec2(xRight2 - wBid, y0), ImVec2(xRight2, y1), colB);
+                }
+                if (bestAsk > 0.0) {
+                    ImU32 colA = IM_COL32(230,110,90, 200);
+                    float y0 = std::max(p0.y, yAsk - stripeH*0.5f), y1 = std::min(p1.y, yAsk + stripeH*0.5f);
+                    dl->AddRectFilled(ImVec2(xRight2 - wAsk, y0), ImVec2(xRight2, y1), colA);
+                }
+            }
+        }
+
+        // Open Orders overlay: horizontal lines with labels; show drag preview if any
+        if (!oos.empty()) {
+            for (const auto &x : oos) {
+                if (x.price <= 0.0 || x.type != "LIMIT") continue;
+                double price = x.price;
+                if (s_draggingOrder && s_dragOrderId == x.id) price = s_dragNewPrice;
+                float y = p_to_y(price);
+                ImU32 col = (x.side == "BUY") ? IM_COL32(70,200,140,230) : IM_COL32(230,120,90,230);
+                // draw line across chart
+                dl->AddLine(ImVec2(p0.x+1, y), ImVec2(p1.x-60.0f, y), col, (s_draggingOrder && s_dragOrderId==x.id)?2.0f:1.3f);
+                // right label + quick-cancel x button
+                {
+                    char lab[160]; snprintf(lab, sizeof(lab), "%s %.6f @ %.2f  #%lld", x.side.c_str(), std::max(0.0, x.origQty - x.executedQty), price, x.id);
+                    ImVec2 ts = ImGui::CalcTextSize(lab);
+                    float xSz = 14.0f;
+                    ImVec2 xMin = ImVec2(p1.x - ts.x - 6.0f - xSz - 6.0f, y - xSz*0.5f);
+                    ImVec2 xMax = ImVec2(xMin.x + xSz, xMin.y + xSz);
+                    bool xHovered = ImGui::IsMouseHoveringRect(xMin, xMax, true);
+                    if (xHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && s_restChart) { async_cancel(x.id /*by id only*/); }
+                    // Keyboard quick-cancel when hovering an order line: press 'X'
+                    if (xHovered && !ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X)) { async_cancel(x.id); }
+                    ImU32 xbg = xHovered ? IM_COL32(70,30,30,255) : IM_COL32(50,20,20,230);
+                    ImU32 xfg = IM_COL32(220,80,80,255);
+                    dl->AddRectFilled(xMin, xMax, xbg, 3.0f);
+                    dl->AddLine(ImVec2(xMin.x+3, xMin.y+3), ImVec2(xMax.x-3, xMax.y-3), xfg, 1.8f);
+                    dl->AddLine(ImVec2(xMin.x+3, xMax.y-3), ImVec2(xMax.x-3, xMin.y+3), xfg, 1.8f);
+                    if (xHovered) { ImGui::SetTooltip("Cancel order #%lld", x.id); }
+                    ImVec2 rb = ImVec2(xMax.x + 4.0f, y - ts.y*0.5f);
+                    float pad = 2.0f;
+                    dl->AddRectFilled(ImVec2(rb.x - pad - 2, rb.y - pad), ImVec2(rb.x + ts.x + pad + 2, rb.y + ts.y + pad), IM_COL32(18,18,22,210), 3.0f);
+                    dl->AddText(rb, col, lab);
+                }
+            }
+        }
+
+        // Build interactive hit areas for each open order line (custom hit-test; no layout disruption)
+        if (!oos.empty()) {
+            static long long s_ctxOrderId = 0; // for context menu
+            for (size_t i=0;i<oos.size(); ++i) {
+                const auto &x = oos[i]; if (x.price <= 0.0 || x.type != "LIMIT") continue;
+                float y = p_to_y(x.price);
+                float marginRight = 64.0f;
+                ImVec2 rmin(p0.x, y - 6.0f), rmax(std::max(p0.x + 20.0f, p1.x - marginRight), y + 6.0f);
+                bool hoveredLine = ImGui::IsMouseHoveringRect(rmin, rmax, true);
+                if (hoveredLine && !ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X)) { async_cancel(x.id); }
+                if (hoveredLine && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    s_draggingOrder = true; s_dragOrderId = x.id; s_dragOrigPrice = x.price; s_dragNewPrice = x.price;
+                    s_dragQty = std::max(0.0, x.origQty - x.executedQty); s_dragSide = x.side; s_dragPosSide = x.pside; s_dragReduceOnly = x.reduceOnly;
+                }
+                if (s_draggingOrder && s_dragOrderId == x.id && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    float my = ImGui::GetIO().MousePos.y; double p = y_to_p(my);
+                    double tick = g_priceTick.load(std::memory_order_relaxed); if (tick <= 0.0) tick = 0.1;
+                    double n = std::floor((p + 1e-12) / tick); s_dragNewPrice = n * tick;
+                }
+                if (s_draggingOrder && s_dragOrderId == x.id && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                    s_draggingOrder = false;
+                    double tick = g_priceTick.load(std::memory_order_relaxed); if (tick <= 0.0) tick = 0.1;
+                    if (fabs(s_dragNewPrice - s_dragOrigPrice) >= tick * 0.5 && s_restChart && s_dragQty > 0.0) {
+                        // Atomic cancel+replace to avoid UI blocking and duplication
+                        async_cancel_replace(x.id, s_dragSide, s_dragQty, s_dragNewPrice, s_dragPosSide, s_dragReduceOnly);
+                    }
+                }
+                if (hoveredLine && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) { s_ctxOrderId = x.id; ImGui::OpenPopup("oo_ctx_chart"); }
+                if (hoveredLine) { ImGui::BeginTooltip(); ImGui::Text("%s %.6f @ %.6f", x.side.c_str(), x.origQty, x.price); ImGui::TextDisabled("Drag to modify. Right-click to cancel."); ImGui::EndTooltip(); }
+            }
+            if (ImGui::BeginPopup("oo_ctx_chart")) {
+                if (ImGui::MenuItem("Cancel Order")) { if (s_ctxOrderId) { async_cancel(s_ctxOrderId); } }
+                ImGui::EndPopup();
+            }
+        }
+
         // Crosshair with date+price labels
         if (showCross && hovered) {
             ImVec2 m = ImGui::GetIO().MousePos;
@@ -2322,8 +2935,30 @@ static void RenderChartWindow()
                 double priceAtMouse = y_to_p(m.y);
                 std::string ps = fmt_price(priceAtMouse);
                 ImVec2 pts = ImGui::CalcTextSize(ps.c_str());
-                dl->AddRectFilled(ImVec2(p1.x - pts.x - 10, m.y - pts.y*0.5f - 2), ImVec2(p1.x - 2, m.y + pts.y*0.5f + 2), IM_COL32(10,60,70,230));
-                dl->AddText(ImVec2(p1.x - pts.x - 6, m.y - pts.y*0.5f), IM_COL32(220,255,255,255), ps.c_str());
+                float rectLeft = p1.x - pts.x - 10;
+                float rectRight = p1.x - 2;
+                float rectTop = m.y - pts.y*0.5f - 2;
+                float rectBot = m.y + pts.y*0.5f + 2;
+                dl->AddRectFilled(ImVec2(rectLeft, rectTop), ImVec2(rectRight, rectBot), IM_COL32(10,60,70,230));
+                dl->AddText(ImVec2(rectLeft + 4, m.y - pts.y*0.5f), IM_COL32(220,255,255,255), ps.c_str());
+                // '+' button just left to the price overlay (draw + custom hit-test; no ImGui item)
+                const float plusSz = 18.0f;
+                ImVec2 plusPos = ImVec2(rectLeft - (plusSz + 6.0f), m.y - plusSz*0.5f);
+                ImVec2 plusMin = plusPos;
+                ImVec2 plusMax = ImVec2(plusPos.x + plusSz, plusPos.y + plusSz);
+                bool hoveredPlus = ImGui::IsMouseHoveringRect(plusMin, plusMax, true);
+                if (hoveredPlus && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    g_showOrderDialog = true; g_dialogFocusNext = true; g_dialogSideIdx = 0; g_dialogTypeIdx = 1; g_dialogTifIdx = 0; g_dialogReduceOnly = false; g_dialogPosSide[0] = 0; g_dialogQty = 0.001f;
+                    double tick = g_priceTick.load(std::memory_order_relaxed); if (tick <= 0.0) tick = 0.1;
+                    double p = priceAtMouse; double n = std::floor((p + 1e-12)/tick); g_dialogPrice = n * tick;
+                }
+                ImVec2 c = ImVec2(plusPos.x + plusSz*0.5f, plusPos.y + plusSz*0.5f);
+                ImU32 col = hoveredPlus ? IM_COL32(50,220,140,255) : IM_COL32(40,170,120,230);
+                dl->AddCircleFilled(c, plusSz*0.5f, IM_COL32(20,20,24,220));
+                dl->AddCircle(c, plusSz*0.5f, col, 24, 1.6f);
+                dl->AddLine(ImVec2(c.x - 4, c.y), ImVec2(c.x + 4, c.y), col, 2.0f);
+                dl->AddLine(ImVec2(c.x, c.y - 4), ImVec2(c.x, c.y + 4), col, 2.0f);
+                if (hoveredPlus) { ImGui::SetTooltip("New order at this price"); }
                 // Time label at bottom
                 time_t sec = (time_t)(t_mouse / 1000);
                 struct tm tmv{};
@@ -2339,6 +2974,68 @@ static void RenderChartWindow()
                 dl->AddRectFilled(ImVec2(tx0, p1.y - tts.y - 6), ImVec2(tx0 + tts.x + 6, p1.y - 2), IM_COL32(20,20,24,230));
                 dl->AddText(ImVec2(tx0 + 3, p1.y - tts.y - 5), IM_COL32(220,220,230,255), ts.c_str());
             }
+        }
+
+        // Order dialog (from crosshair '+')
+        if (g_showOrderDialog) {
+            // Anchor the new panel inside the chart area, ignore saved settings to ensure visibility
+            ImVec2 dlgSize(420, 260);
+            float dlgX = std::max(p0.x + 20.0f, p1.x - dlgSize.x - 16.0f);
+            float dlgY = p0.y + 40.0f;
+            ImGui::SetNextWindowPos(ImVec2(dlgX, dlgY), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(dlgSize, ImGuiCond_Appearing);
+            if (g_dialogFocusNext) { ImGui::SetNextWindowFocus(); g_dialogFocusNext = false; }
+            if (ImGui::Begin("Place Order", &g_showOrderDialog, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+                ImGui::Text("Symbol: %s", g_chartSymbol.c_str());
+                ImGui::Separator();
+                // Side
+                ImGui::TextDisabled("Side"); ImGui::SameLine();
+                ImGui::RadioButton("BUY/LONG", &g_dialogSideIdx, 0); ImGui::SameLine();
+                ImGui::RadioButton("SELL/SHORT", &g_dialogSideIdx, 1);
+                // Type + TIF
+                const char* types[] = {"MARKET","LIMIT"};
+                ImGui::SetNextItemWidth(100); ImGui::Combo("Type", &g_dialogTypeIdx, types, IM_ARRAYSIZE(types));
+                const char* tifs[] = {"GTC","IOC","FOK"};
+                if (g_dialogTypeIdx==1) { ImGui::SameLine(); ImGui::SetNextItemWidth(80); ImGui::Combo("TIF", &g_dialogTifIdx, tifs, IM_ARRAYSIZE(tifs)); }
+                // Qty / Price
+                ImGui::SetNextItemWidth(160); ImGui::InputFloat("Qty", &g_dialogQty, 0.0f, 0.0f, "%.6f");
+                if (g_dialogTypeIdx==1) { ImGui::SameLine(); ImGui::SetNextItemWidth(160); ImGui::InputDouble("Price", &g_dialogPrice, 0.0, 0.0, "%.2f"); }
+                // Flags
+                ImGui::Checkbox("Reduce Only", &g_dialogReduceOnly);
+                ImGui::SameLine(); ImGui::SetNextItemWidth(100); ImGui::InputTextWithHint("PosSide", "(optional) LONG/SHORT", g_dialogPosSide, sizeof(g_dialogPosSide));
+                // Preview
+                double px = g_dialogTypeIdx==1 ? g_dialogPrice : ((g_lastTradePrice.load()>0)? g_lastTradePrice.load() : 0.0);
+                double notion = (px>0)? (double)g_dialogQty * px : 0.0; ImGui::TextDisabled("~Notional: %.2f USDT", notion);
+                // Submit
+                ImVec2 bw(ImGui::GetContentRegionAvail().x*0.5f - 4.0f, 36.0f);
+                auto submit = [&](bool isBuy){
+                    if (!s_restChart) { g_dialogResp = "REST not ready"; return; }
+                    double step = g_qtyStep.load(std::memory_order_relaxed); if (step<=0) step=0.000001;
+                    double minq = g_minQty.load(std::memory_order_relaxed);
+                    auto floor_step = [](double v, double st){ if (st<=0) return v; double n=floor((v+1e-12)/st); return n*st; };
+                    double q = floor_step(g_dialogQty, step); if (q < minq) q = minq;
+                    std::string side = isBuy?"BUY":"SELL";
+                    std::string tif = (g_dialogTifIdx==1?"IOC":(g_dialogTifIdx==2?"FOK":"GTC"));
+                    std::string pside = std::string(g_dialogPosSide);
+                    double tick = g_priceTick.load(std::memory_order_relaxed); if (tick<=0) tick=0.1;
+                    double price = g_dialogTypeIdx==1 ? floor_step(g_dialogPrice, tick) : 0.0;
+                    const char* type = (g_dialogTypeIdx==0?"MARKET":"LIMIT");
+                    auto r = s_restChart->placeOrder(g_chartSymbol, side, type, q, price, tif, g_dialogReduceOnly, false, 5000, pside, 0.0, "MARK_PRICE");
+                    char hdr[96]; snprintf(hdr,sizeof(hdr),"%s %s %.6f %s", g_chartSymbol.c_str(), side.c_str(), q, type);
+                    g_dialogResp = std::string(hdr) + ": " + (r.ok?"OK ":"ERR ") + std::to_string(r.status) + "\n" + r.body;
+                };
+                ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(40,150,90,255));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(60,180,110,255));
+                if (ImGui::Button("Place BUY / LONG", bw)) submit(true);
+                ImGui::PopStyleColor(2);
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(160,60,60,255));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(190,80,80,255));
+                if (ImGui::Button("Place SELL / SHORT", bw)) submit(false);
+                ImGui::PopStyleColor(2);
+                if (!g_dialogResp.empty()) { ImGui::Separator(); ImGui::BeginChild("odlg_resp", ImVec2(0,100), true); ImGui::TextUnformatted(g_dialogResp.c_str()); ImGui::EndChild(); }
+            }
+            ImGui::End();
         }
 
         // End chart-area clipping
@@ -2529,6 +3226,9 @@ static void GuiMain()
     ImGui::StyleColorsDark();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    // Start global pollers (orders/fills + BNBUSDT ticker) regardless of UI tabs
+    StartOrdersAndFillsPollerOnce();
+    StartBnbTickerPollerOnce();
 
     // Main loop
     MSG msg;
@@ -2597,8 +3297,8 @@ int main() {
         const std::string host = "fstream.binance.com"; // futures
         const std::string port = "443";
 
-        // Hide console window (we keep Console subsystem for simpler linking)
-        ::ShowWindow(::GetConsoleWindow(), SW_HIDE);
+        // Ensure console window is visible for API call results
+        ::ShowWindow(::GetConsoleWindow(), SW_SHOW);
 
         // Start 10 worker threads with small stagger to smooth updates
         const int kWorkers = 20;
@@ -2616,3 +3316,8 @@ int main() {
     }
     return 0;
 }
+
+
+
+
+

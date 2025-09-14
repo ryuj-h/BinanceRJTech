@@ -50,6 +50,8 @@ public:
     // Orders/Fills
     Result getOpenOrders(const std::string& symbol, int recvWindowMs = 5000);
     Result getUserTrades(const std::string& symbol, int limit = 50, int recvWindowMs = 5000);
+    // Public ticker price (e.g., "BNBUSDT")
+    Result getTickerPrice(const std::string& symbol);
 
     // Cancel orders
     Result cancelOrder(
@@ -58,6 +60,22 @@ public:
         const std::string& origClientOrderId = "",
         int recvWindowMs = 5000);
     Result cancelAllOpenOrders(const std::string& symbol, int recvWindowMs = 5000);
+    // Order book snapshot (unsiged)
+    Result getDepth(const std::string& symbol, int limit = 500);
+    // Atomic cancel+replace for editing an existing order (Futures)
+    // POST /fapi/v1/order/cancelReplace
+    Result cancelReplaceOrder(
+        const std::string& symbol,
+        long long cancelOrderId,
+        const std::string& side,
+        const std::string& type,
+        double quantity,
+        double price,
+        const std::string& timeInForce = "GTC",
+        bool reduceOnly = false,
+        const std::string& positionSide = "",
+        const std::string& cancelReplaceMode = "STOP_ON_FAILURE",
+        int recvWindowMs = 5000);
 
     // Configure API key/secret (fallback to env)
     void setCredentials(const std::string& apiKey, const std::string& apiSecret);
@@ -74,3 +92,4 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+

@@ -134,7 +134,13 @@ struct BinanceRest::Impl {
             stream.handshake(ssl::stream_base::client);
 
             http::request<http::string_body> req;
-            if (isPost) req.method(http::verb::post); else req.method(http::verb::get);
+            // Select HTTP verb based on 'method' argument
+            http::verb verb = http::verb::get;
+            if (method == "GET") verb = http::verb::get;
+            else if (method == "POST") verb = http::verb::post;
+            else if (method == "DELETE") verb = http::verb::delete_;
+            else if (method == "PUT") verb = http::verb::put;
+            req.method(verb);
             req.target(target);
             req.version(11);
             req.set(http::field::host, host);
@@ -246,6 +252,19 @@ BinanceRest::Result BinanceRest::cancelAllOpenOrders(const std::string& symbol, 
     return impl_->https_request("DELETE", "/fapi/v1/allOpenOrders?" + qs, {}, false, impl_->apiKey);
 }
 
+BinanceRest::Result BinanceRest::getDepth(const std::string& symbol, int limit) {
+    std::ostringstream q;
+    q << "/fapi/v1/depth?symbol=" << symbol;
+    if (limit > 0) q << "&limit=" << limit;
+    return impl_->https_request("GET", q.str(), {}, false, {});
+}
+
+BinanceRest::Result BinanceRest::getTickerPrice(const std::string& symbol) {
+    std::ostringstream q;
+    q << "/fapi/v1/ticker/price?symbol=" << symbol;
+    return impl_->https_request("GET", q.str(), {}, false, {});
+}
+
 BinanceRest::Result BinanceRest::placeOrder(const std::string& symbol, const std::string& side, const std::string& type, double quantity, double price, const std::string& tif, bool reduceOnly, bool testOnly, int recvWindowMs, const std::string& positionSide, double stopPrice, const std::string& workingType) {
     // Build query
     using namespace std::chrono;
@@ -306,4 +325,40 @@ BinanceRest::Result BinanceRest::setDualPosition(bool enable) {
     std::string qs = q.str();
     qs += "&signature=" + impl_->hmac_sha256_hex(qs);
     return impl_->https_request("POST", "/fapi/v1/positionSide/dual?" + qs, "", true, impl_->apiKey);
+}
+
+BinanceRest::Result BinanceRest::cancelReplaceOrder(
+    const std::string& symbol,
+    long long cancelOrderId,
+    const std::string& side,
+    const std::string& type,
+    double quantity,
+    double price,
+    const std::string& timeInForce,
+    bool reduceOnly,
+    const std::string& positionSide,
+    const std::string& cancelReplaceMode,
+    int recvWindowMs)
+{
+    using namespace std::chrono;
+    long long ts = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() + impl_->timeOffsetMs;
+    std::ostringstream q;
+    q << "symbol=" << symbol;
+    q << "&cancelOrderId=" << cancelOrderId;
+    q << "&side=" << side;
+    q << "&type=" << type;
+    q << std::fixed << std::setprecision(8);
+    q << "&quantity=" << quantity;
+    if (type == "LIMIT") {
+        q << "&price=" << price;
+        q << "&timeInForce=" << timeInForce;
+    }
+    if (!positionSide.empty()) q << "&positionSide=" << positionSide;
+    if (reduceOnly) q << "&reduceOnly=true";
+    q << "&cancelReplaceMode=" << cancelReplaceMode;
+    q << "&recvWindow=" << recvWindowMs;
+    q << "&timestamp=" << ts;
+    std::string qs = q.str();
+    qs += "&signature=" + impl_->hmac_sha256_hex(qs);
+    return impl_->https_request("POST", "/fapi/v1/order/cancelReplace?" + qs, "", true, impl_->apiKey);
 }
