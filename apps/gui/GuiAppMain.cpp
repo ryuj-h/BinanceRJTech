@@ -1,6 +1,7 @@
 // Dear ImGui visualization entry point
 
-#include "WebSocket.hpp"
+#include "binancerj/telemetry/PerfTelemetry.hpp"
+#include "binancerj/net/WebSocket.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -39,7 +40,7 @@
 #include "third_party/imgui/imgui.h"
 #include "third_party/imgui/backends/imgui_impl_win32.h"
 #include "third_party/imgui/backends/imgui_impl_dx11.h"
-#include "BinanceRest.hpp"
+#include "binancerj/net/BinanceRest.hpp"
 
 // Shared state for visualization
 static std::atomic<int> messageCount{0};
@@ -3221,7 +3222,8 @@ static void GuiMain()
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
-    io.IniFilename = "imgui_layout.ini"; // remember window positions/sizes
+    io.IniFilename = "assets/ui/imgui_layout.ini"; // remember window positions/sizes
+    ImGui::LoadIniSettingsFromDisk(io.IniFilename);
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
     ImGui_ImplWin32_Init(hwnd);
@@ -3235,7 +3237,6 @@ static void GuiMain()
     ZeroMemory(&msg, sizeof(msg));
     auto tickStart = std::chrono::steady_clock::now();
     using clock = std::chrono::steady_clock;
-    auto frameStart = clock::now();
     while (msg.message != WM_QUIT)
     {
         if (PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE))
@@ -3245,12 +3246,16 @@ static void GuiMain()
             continue;
         }
 
+        auto loopBegin = clock::now();
+        telemetry::ScopedTimer frameTimer("gui", "frame");
+
         // Update 1-second counter
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - tickStart);
         if (elapsed.count() >= 1) {
             tickStart = now;
             lastMessageCount.store(messageCount.exchange(0), std::memory_order_acq_rel);
+            telemetry::logGauge("gui", "order_updates_per_second", static_cast<double>(lastMessageCount.load(std::memory_order_acquire)));
         }
 
         // Start frame
@@ -3270,13 +3275,14 @@ static void GuiMain()
         // Present immediately (no vsync) and cap to ~100 FPS
         g_pSwapChain->Present(0, 0);
 
-        /*auto frameEnd = clock::now();
-        auto frameDur = std::chrono::duration_cast<std::chrono::microseconds>(frameEnd - frameStart);
-        const auto target = std::chrono::milliseconds(10); // ~100 FPS
-        if (frameDur < target)
-            std::this_thread::sleep_for(target - frameDur);
-        frameStart = clock::now();
-    */
+        auto frameEnd = clock::now();
+        auto frameDur = std::chrono::duration_cast<std::chrono::microseconds>(frameEnd - loopBegin);
+        if (frameDur.count() > 0) {
+            double frameMs = frameDur.count() / 1000.0;
+            telemetry::logGauge("gui", "frame_time_ms", frameMs);
+            double fps = 1000.0 / frameMs;
+            telemetry::logGauge("gui", "fps", fps);
+        }
     }
 
     // Cleanup
@@ -3294,6 +3300,8 @@ static void GuiMain()
 
 int main() {
     try {
+        telemetry::startSession("gui_app");
+        telemetry::logEvent("gui", "entry");
         const std::string host = "fstream.binance.com"; // futures
         const std::string port = "443";
 
@@ -3309,11 +3317,14 @@ int main() {
         // Start public trades receiver for BTCUSDT
         std::thread(receivePublicTrades, host, port, std::string("btcusdt")).detach();
         GuiMain();
+        telemetry::logEvent("gui", "exit");
     }
     catch (const std::exception& ex) {
         std::cerr << "Fatal error: " << ex.what() << std::endl;
+        telemetry::logEvent("gui", std::string("fatal_error msg=") + ex.what());
         return 1;
     }
+    telemetry::flush();
     return 0;
 }
 

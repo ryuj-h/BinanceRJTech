@@ -1,4 +1,5 @@
-#include "BinanceRest.hpp"
+#include "binancerj/net/BinanceRest.hpp"
+#include "binancerj/telemetry/PerfTelemetry.hpp"
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
@@ -110,6 +111,8 @@ struct BinanceRest::Impl {
 
     Result https_request(const std::string& method, const std::string& target, const std::string& bodyOrQuery, bool isPost, const std::string& apiKeyHdr) {
         Result r;
+        telemetry::logEvent("rest", "call method=" + method + " target=" + target);
+        telemetry::ScopedTimer timer("rest", method + ":" + target);
         try {
             boost::asio::io_context ioc;
             ssl::context ctx(ssl::context::tlsv12_client);
@@ -165,10 +168,13 @@ struct BinanceRest::Impl {
             r.ok = (res.result_int() >= 200 && res.result_int() < 300);
             r.status = res.result_int();
             r.body = std::move(res.body());
+            telemetry::logGauge("rest", "status_code", static_cast<double>(r.status));
+            telemetry::logGauge("rest", "payload_bytes", static_cast<double>(r.body.size()));
         } catch (const std::exception& ex) {
             r.ok = false;
             r.status = -1;
             r.body = std::string("HTTPS error: ") + ex.what();
+            telemetry::logEvent("rest", std::string("error method=") + method + " target=" + target + " msg=" + ex.what());
         }
         return r;
     }

@@ -15,10 +15,22 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="WebSocket.cpp">
+    <ClCompile Include="apps\console\legacy_depth_viewer.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
-    <ClCompile Include="GuiAppMain.cpp">
+    <ClCompile Include="apps\console\main.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="apps\gui\GuiAppMain.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\telemetry\PerfTelemetry.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="src\net\WebSocket.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="src\net\BinanceRest.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
     <ClCompile Include="third_party\imgui\imgui.cpp">
@@ -39,15 +51,15 @@
     <ClCompile Include="third_party\imgui\backends\imgui_impl_dx11.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
-    <ClCompile Include="BinanceRest.cpp">
-      <Filter>소스 파일</Filter>
-    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="WebSocket.hpp">
+    <ClInclude Include="include\binancerj\net\WebSocket.hpp">
       <Filter>헤더 파일</Filter>
     </ClInclude>
-    <ClInclude Include="BinanceRest.hpp">
+    <ClInclude Include="include\binancerj\net\BinanceRest.hpp">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="include\binancerj\telemetry\PerfTelemetry.hpp">
       <Filter>헤더 파일</Filter>
     </ClInclude>
   </ItemGroup>

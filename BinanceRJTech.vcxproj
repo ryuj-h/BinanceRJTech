@@ -71,8 +71,8 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IncludePath>C:\Users\User\Desktop\BinanceRJTech\boost_1_89_0;C:\Users\User\Desktop\BinanceRJTech\include\include;C:\Users\DevRyu\source\repos\BinanceRJTech\include\include;C:\Program Files\OpenSSL-Win64\include;C:\Users\DevRyu\source\repos\BinanceRJTech\boost_1_89_0;C:\local\boost_1_86_0;$(IncludePath)</IncludePath>
-    <LibraryPath>C:\Users\User\Desktop\BinanceRJTech\boost_1_89_0\libs;C:\Users\DevRyu\source\repos\BinanceRJTech\boost_1_89_0;C:\Users\DevRyu\source\repos\BinanceRJTech\boost_1_89_0\libs;C:\Program Files\OpenSSL-Win64\lib\VC\x64\MT;C:\Program Files\OpenSSL-Win64\lib;C:\local\boost_1_86_0\libs;C:\local\boost_1_86_0;$(LibraryPath)</LibraryPath>
+    <IncludePath>C:\Program Files\OpenSSL-Win64\include;$(ProjectDir)include;$(ProjectDir)third_party\boost\1.89.0\boost;$(IncludePath)</IncludePath>
+    <LibraryPath>C:\Program Files\OpenSSL-Win64\lib\VC\x64\MT;C:\Program Files\OpenSSL-Win64\lib;$(ProjectDir)third_party\boost\1.89.0\boost\lib;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -81,7 +81,7 @@
       <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)third_party\imgui;$(ProjectDir)third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)third_party\boost\1.89.0\boost;$(ProjectDir)third_party\imgui;$(ProjectDir)third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -98,7 +98,7 @@
       <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)third_party\imgui;$(ProjectDir)third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)third_party\boost\1.89.0\boost;$(ProjectDir)third_party\imgui;$(ProjectDir)third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -115,7 +115,7 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)third_party\imgui;$(ProjectDir)third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)third_party\boost\1.89.0\boost;$(ProjectDir)third_party\imgui;$(ProjectDir)third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -132,7 +132,7 @@
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)third_party\imgui;$(ProjectDir)third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\PersonalProj\BinanceRJTech;C:\PersonalProj\BinanceRJTech\include\single_include;C:\PersonalProj\BinanceRJTech\include\include;$(ProjectDir)include;$(ProjectDir)third_party\boost\1.89.0\boost;$(ProjectDir)third_party\imgui;$(ProjectDir)third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -143,9 +143,12 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="GuiAppMain.cpp" />
-    <ClCompile Include="WebSocket.cpp" />
-    <ClCompile Include="BinanceRest.cpp" />
+    <ClCompile Include="apps\console\legacy_depth_viewer.cpp" />
+    <ClCompile Include="apps\console\main.cpp" />
+    <ClCompile Include="apps\gui\GuiAppMain.cpp" />
+    <ClCompile Include="src\core\telemetry\PerfTelemetry.cpp" />
+    <ClCompile Include="src\net\WebSocket.cpp" />
+    <ClCompile Include="src\net\BinanceRest.cpp" />
     <ClCompile Include="third_party\imgui\imgui.cpp" />
     <ClCompile Include="third_party\imgui\imgui_draw.cpp" />
     <ClCompile Include="third_party\imgui\imgui_tables.cpp" />
@@ -154,8 +157,9 @@
     <ClCompile Include="third_party\imgui\backends\imgui_impl_dx11.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="WebSocket.hpp" />
-    <ClInclude Include="BinanceRest.hpp" />
+    <ClInclude Include="include\binancerj\telemetry\PerfTelemetry.hpp" />
+    <ClInclude Include="include\binancerj\net\WebSocket.hpp" />
+    <ClInclude Include="include\binancerj\net\BinanceRest.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

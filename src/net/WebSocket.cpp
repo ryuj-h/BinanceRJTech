@@ -1,4 +1,5 @@
-#include "WebSocket.hpp"
+#include "binancerj/net/WebSocket.hpp"
+#include "binancerj/telemetry/PerfTelemetry.hpp"
 #include <boost/beast/websocket/ssl.hpp>
 #include <boost/system/error_code.hpp>
 #include <iostream>
@@ -19,6 +20,7 @@ WebSocket::~WebSocket() {
 
 void WebSocket::connect() {
     try {
+        telemetry::ScopedTimer timer("ws", "connect");
         boost::asio::ip::tcp::resolver resolver(io_context_);
         auto const results = resolver.resolve(host_, port_);
 
@@ -26,30 +28,39 @@ void WebSocket::connect() {
         ws_.next_layer().handshake(boost::asio::ssl::stream_base::client);
         ws_.handshake(host_, "/ws");
         std::cout << "Connected to " << host_ << std::endl;
+        telemetry::logEvent("ws", "connected host=" + host_);
     }
     catch (const std::exception& ex) {
         std::cerr << "Connection error: " << ex.what() << std::endl;
+        telemetry::logEvent("ws", std::string("connect_error host=") + host_ + " msg=" + ex.what());
         throw;
     }
 }
 
 void WebSocket::send(const std::string& message) {
     try {
+        telemetry::ScopedTimer timer("ws", "send");
         ws_.write(boost::asio::buffer(message));
+        telemetry::logGauge("ws", "send_bytes", static_cast<double>(message.size()));
     }
     catch (const std::exception& ex) {
         std::cerr << "Send error: " << ex.what() << std::endl;
+        telemetry::logEvent("ws", std::string("send_error host=") + host_ + " msg=" + ex.what());
     }
 }
 
 std::string WebSocket::receive() {
     try {
+        telemetry::ScopedTimer timer("ws", "receive");
         boost::beast::flat_buffer buffer;
         ws_.read(buffer);
-        return boost::beast::buffers_to_string(buffer.data());
+        auto payload = boost::beast::buffers_to_string(buffer.data());
+        telemetry::logGauge("ws", "receive_bytes", static_cast<double>(payload.size()));
+        return payload;
     }
     catch (const std::exception& ex) {
         std::cerr << "Receive error: " << ex.what() << std::endl;
+        telemetry::logEvent("ws", std::string("receive_error host=") + host_ + " msg=" + ex.what());
         return "";
     }
 }
@@ -58,8 +69,10 @@ void WebSocket::close() {
     try {
         ws_.close(boost::beast::websocket::close_code::normal);
         std::cout << "WebSocket closed" << std::endl;
+        telemetry::logEvent("ws", "closed host=" + host_);
     }
     catch (const std::exception& ex) {
         std::cerr << "Close error: " << ex.what() << std::endl;
+        telemetry::logEvent("ws", std::string("close_error host=") + host_ + " msg=" + ex.what());
     }
 }
