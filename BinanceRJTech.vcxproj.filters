@@ -1,66 +1,123 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
-    <Filter Include="소스 파일">
-      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
-      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{6E42E911-5C50-4C6A-9120-9B9E2EE0D7B1}</UniqueIdentifier>
     </Filter>
-    <Filter Include="헤더 파일">
-      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
-      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    <Filter Include="Source Files\apps">
+      <UniqueIdentifier>{702E77C4-B1AB-4DF2-8299-2FA8E771F4D4}</UniqueIdentifier>
     </Filter>
-    <Filter Include="리소스 파일">
-      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
-      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    <Filter Include="Source Files\apps\console">
+      <UniqueIdentifier>{BAF1CB52-9C11-44B4-BB8E-AB8A7E160204}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\apps\gui">
+      <UniqueIdentifier>{32D1A963-90B2-4D9C-AC6A-FCB0EE33C4F5}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\src">
+      <UniqueIdentifier>{1D50FB32-13AD-4F1F-9DB1-5E594D3FB39C}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\src\core">
+      <UniqueIdentifier>{DB5D8F92-A9A4-4F2D-A68F-ADD8BFB74741}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\src\core\telemetry">
+      <UniqueIdentifier>{E7A8FF3B-0396-42A8-9E8E-6E39F5E9B9C9}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\src\net">
+      <UniqueIdentifier>{5A3AE0D2-AC5C-46B5-B1C8-95C66FCEA38F}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\third_party">
+      <UniqueIdentifier>{C42E63E9-E3BC-4CCB-966C-5DADB5F508E1}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\third_party\imgui">
+      <UniqueIdentifier>{24C73BA6-6ED4-4BDA-BEEB-718FCDAF77A8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\third_party\imgui\backends">
+      <UniqueIdentifier>{9D9F9C57-4559-4A31-9F4B-1E67E6CD61F7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4B04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\include">
+      <UniqueIdentifier>{E8FE2C3D-2F0A-4A02-B542-251BE948C736}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\include\binancerj">
+      <UniqueIdentifier>{77C965F9-2876-4E82-8A44-897A46DDBAE5}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\include\binancerj\core">
+      <UniqueIdentifier>{93F08DE1-7296-433C-9283-B93D17DCC6B4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\include\binancerj\net">
+      <UniqueIdentifier>{6B50E469-5C6F-4BF3-9B7B-8A82BD87F84B}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\include\binancerj\telemetry">
+      <UniqueIdentifier>{7D72B868-62DF-4E9C-BF3D-FE47E8D16A94}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4C08-8B7A-83BB121AAD01}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="apps\console\legacy_depth_viewer.cpp">
-      <Filter>소스 파일</Filter>
+      <Filter>Source Files\apps\console</Filter>
     </ClCompile>
     <ClCompile Include="apps\console\main.cpp">
-      <Filter>소스 파일</Filter>
+      <Filter>Source Files\apps\console</Filter>
     </ClCompile>
     <ClCompile Include="apps\gui\GuiAppMain.cpp">
-      <Filter>소스 파일</Filter>
+      <Filter>Source Files\apps\gui</Filter>
     </ClCompile>
     <ClCompile Include="src\core\telemetry\PerfTelemetry.cpp">
-      <Filter>소스 파일</Filter>
+      <Filter>Source Files\src\core\telemetry</Filter>
     </ClCompile>
-    <ClCompile Include="src\net\WebSocket.cpp">
-      <Filter>소스 파일</Filter>
+    <ClCompile Include="src\core\ThreadPool.cpp">
+      <Filter>Source Files\src\core</Filter>
     </ClCompile>
     <ClCompile Include="src\net\BinanceRest.cpp">
-      <Filter>소스 파일</Filter>
+      <Filter>Source Files\src\net</Filter>
+    </ClCompile>
+    <ClCompile Include="src\net\AsyncWebSocketHub.cpp">
+      <Filter>Source Files\src\net</Filter>
+    </ClCompile>
+    <ClCompile Include="src\net\WebSocket.cpp">
+      <Filter>Source Files\src\net</Filter>
     </ClCompile>
     <ClCompile Include="third_party\imgui\imgui.cpp">
-      <Filter>소스 파일</Filter>
+      <Filter>Source Files\third_party\imgui</Filter>
     </ClCompile>
     <ClCompile Include="third_party\imgui\imgui_draw.cpp">
-      <Filter>소스 파일</Filter>
+      <Filter>Source Files\third_party\imgui</Filter>
     </ClCompile>
     <ClCompile Include="third_party\imgui\imgui_tables.cpp">
-      <Filter>소스 파일</Filter>
+      <Filter>Source Files\third_party\imgui</Filter>
     </ClCompile>
     <ClCompile Include="third_party\imgui\imgui_widgets.cpp">
-      <Filter>소스 파일</Filter>
-    </ClCompile>
-    <ClCompile Include="third_party\imgui\backends\imgui_impl_win32.cpp">
-      <Filter>소스 파일</Filter>
+      <Filter>Source Files\third_party\imgui</Filter>
     </ClCompile>
     <ClCompile Include="third_party\imgui\backends\imgui_impl_dx11.cpp">
-      <Filter>소스 파일</Filter>
+      <Filter>Source Files\third_party\imgui\backends</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\imgui\backends\imgui_impl_win32.cpp">
+      <Filter>Source Files\third_party\imgui\backends</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="include\binancerj\net\WebSocket.hpp">
-      <Filter>헤더 파일</Filter>
-    </ClInclude>
     <ClInclude Include="include\binancerj\net\BinanceRest.hpp">
-      <Filter>헤더 파일</Filter>
+      <Filter>Header Files\include\binancerj\net</Filter>
+    </ClInclude>
+    <ClInclude Include="include\binancerj\net\AsyncWebSocketHub.hpp">
+      <Filter>Header Files\include\binancerj\net</Filter>
+    </ClInclude>
+    <ClInclude Include="include\binancerj\net\WebSocket.hpp">
+      <Filter>Header Files\include\binancerj\net</Filter>
     </ClInclude>
     <ClInclude Include="include\binancerj\telemetry\PerfTelemetry.hpp">
-      <Filter>헤더 파일</Filter>
+      <Filter>Header Files\include\binancerj\telemetry</Filter>
+    </ClInclude>
+    <ClInclude Include="include\binancerj\core\BoundedQueue.hpp">
+      <Filter>Header Files\include\binancerj\core</Filter>
+    </ClInclude>
+    <ClInclude Include="include\binancerj\core\ThreadPool.hpp">
+      <Filter>Header Files\include\binancerj\core</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

@@ -1,46 +1,46 @@
-﻿# Refactoring & Modernization Plan
+# 由ы뙥?곕쭅 諛??꾨???怨꾪쉷
 
-## Phase 0: Baseline & Risk Guardrails
-- Instrument frame timing, network latency, and thread utilization across Main.cpp, GuiAppMain.cpp, BinanceRest.cpp, and WebSocket.cpp; capture representative log snapshots for comparison.
-- Establish a repeatable smoke test matrix covering GUI launch, order placement, and WebSocket streaming; version the checklist alongside this plan.
-- Configure crash dump collection, WinDbg scripts, and rollback runbooks so every subsequent phase maintains functional parity with zero regressions.
+## ?섏씠利?0: 湲곗???諛?由ъ뒪??媛?쒕젅??(?꾨즺)
+- Main.cpp, GuiAppMain.cpp, BinanceRest.cpp, WebSocket.cpp ?꾨컲?먯꽌 ?꾨젅????대컢, ?ㅽ듃?뚰겕 吏?? ?ㅻ젅???쒖슜?꾨? 怨꾩륫?섍퀬 鍮꾧탳瑜??꾪븳 ???濡쒓렇 ?ㅻ깄?룹쓣 ?뺣낫?쒕떎.
+- GUI ?ㅽ뻾, 二쇰Ц 諛쒖＜, WebSocket ?ㅽ듃由щ컢???ш큵?섎뒗 ?ы쁽 媛?ν븳 ?ㅻえ???뚯뒪??留ㅽ듃由?뒪瑜??뺣┰?섍퀬, 泥댄겕由ъ뒪?몃? 蹂?怨꾪쉷怨??④퍡 踰꾩쟾?뷀븳??
+- ?щ옒???ㅽ봽 ?섏쭛, WinDbg ?ㅽ겕由쏀듃, 濡ㅻ갚 ?곕턿??援ъ꽦?섏뿬 ?댄썑 紐⑤뱺 ?섏씠利덇? 湲곕뒫???숇벑?깆쓣 ?좎??섍퀬 ?뚭? ?놁씠 吏꾪뻾?섎룄濡??쒕떎.
 
-## Phase 1: Repository Restructure & Module Boundaries
-- Adopt a layered directory layout:
-  - `apps/` (console, GUI, background services)
-  - `src/core/` (execution engine, data pipelines)
-  - `src/net/` (REST, WebSocket clients)
-  - `src/ui/` (ImGui views, widgets, theming)
-  - `include/` mirrored headers
-  - `tests/` for automation scaffolding
-  - `assets/` (imgui.ini, themes), `docs/`, `tools/`
-- Update `.vcxproj` filters to match the new hierarchy and ensure MSBuild/VS references remain stable.
-- Move vendored libraries to `third_party/` with versioned subfolders and add a sync script for upgrades.
+## ?섏씠利?1: ??μ냼 ?ш뎄??諛?紐⑤뱢 寃쎄퀎 (?꾨즺)
+- ?ㅼ쓬怨?媛숈? 怨꾩링???붾젆?곕━ 援ъ“瑜?梨꾪깮?쒕떎:
+  - `apps/`(肄섏넄, GUI, 諛깃렇?쇱슫???쒕퉬??
+  - `src/core/`(?ㅽ뻾 ?붿쭊, ?곗씠???뚯씠?꾨씪??
+  - `src/net/`(REST, WebSocket ?대씪?댁뼵??
+  - `src/ui/`(ImGui 酉? ?꾩젽, ?뚮쭏)
+  - `include/`??誘몃윭留곷맂 ?ㅻ뜑
+  - ?먮룞???ㅼ틦?대뵫???꾪븳 `tests/`
+  - `assets/`(imgui.ini, ?뚮쭏), `docs/`, `tools/`
+- `.vcxproj` ?꾪꽣瑜???怨꾩링 援ъ“??留욊쾶 ?낅뜲?댄듃?섍퀬 MSBuild/VS 李몄“媛 ?덉젙?곸쑝濡??좎??섎룄濡??쒕떎.
+- 踰ㅻ뜑 ?쇱씠釉뚮윭由щ? 踰꾩쟾蹂??섏쐞 ?대뜑? ?④퍡 `third_party/`濡??대룞?섍퀬, ?낃렇?덉씠???먮룞?붾? ?꾪븳 ?숆린???ㅽ겕由쏀듃瑜?異붽??쒕떎.
 
-## Phase 2: Performance & Multithreading Foundation
-- Partition work into dedicated render, network I/O, and data-processing pools using `std::jthread` or a tuned thread pool; exchange data via lock-free ring buffers or bounded concurrent queues.
-- Move blocking REST requests onto asynchronous pipelines and keep the GUI message pump single-responsibility; adopt event-driven dispatch for WebSocket callbacks.
-- Profile CPU hotspots; evaluate SIMD (AVX2) paths for heavy math and ensure Boost ASIO executors scale with measured workload.
+## ?섏씠利?2: ?깅뒫 諛?硫?곗뒪?덈뵫 湲곕컲 (吏꾪뻾 以?
+- ?ㅽ듃?뚰겕 I/O瑜??꾩슜 `AsyncWebSocketHub`(io_context 湲곕컲)濡??섎졃?섍퀬 硫붿떆吏???쒗븳 ?먯? ?ㅻ젅?쒗????듯빐 ?꾨떒 泥섎━?쒕떎.
+- 釉붾줈??REST ?붿껌??鍮꾨룞湲??뚯씠?꾨씪?몄쑝濡??댁쟾?섍퀬 GUI 硫붿떆吏 ?뚰봽瑜??⑥씪 梨낆엫?쇰줈 ?좎??쒕떎. WebSocket 肄쒕갚? ?대깽??湲곕컲 ?붿뒪?⑥튂濡??꾪솚?쒕떎.
+- CPU 蹂묐ぉ???꾨줈?뚯씪留곹븯怨?臾닿굅??怨꾩궛?먮뒗 SIMD(AVX2) 寃쎈줈瑜?寃?좏븯硫? Boost ASIO ?ㅽ뻾湲곌? 痢≪젙???뚰겕濡쒕뱶? ?④퍡 ?뺤옣?섎뒗吏 ?뺤씤?쒕떎.
 
-## Phase 3: Server Latency Minimization
-- Implement batched signing for REST calls, shared nonce management, and adaptive retry policies encapsulated in a policy class.
-- Cache frequently requested metadata (symbols, fees) with TTL refresh; design a lightweight pub/sub to invalidate dependents.
-- Emit latency metrics (p95, p99, throughput) via a Prometheus-friendly endpoint and trigger watchdog alerts when SLOs drift.
+## ?섏씠利?3: ?쒕쾭 吏??理쒖냼??(?湲?
+- REST ?몄텧???꾪븳 ?쇨큵 ?쒕챸, 怨듭쑀 ?쇱뒪 愿由? ?곸쓳???ъ떆???뺤콉???뺤콉 ?대옒?ㅻ줈 罹≪뒓?뷀빐 援ы쁽?쒕떎.
+- ?먯＜ ?붿껌?섎뒗 硫뷀??곗씠???щ낵, ?섏닔猷???TTL 媛깆떊怨??④퍡 罹먯떆?섍퀬, 醫낆냽?깆쓣 臾댄슚?뷀븯??寃쎈웾 pub/sub瑜??ㅺ퀎?쒕떎.
+- p95, p99, 泥섎━?됱쓣 ?ы븿??吏??硫뷀듃由?쓣 Prometheus 移쒗솕???붾뱶?ъ씤?몃줈 ?대낫?닿퀬 SLO ?댄깉 ??媛먯떆 寃쎄퀬瑜??몃━嫄고븳??
 
-## Phase 4: Stock Client Feature Expansion
-- Portfolio view: add multi-symbol watchlists, aggregated P&L charts, and per-exchange balances with real-time updates.
-- Order management: implement advanced order types (OCO, trailing stop), client-side validation, and editable order history.
-- Risk controls: include exposure limits, alert thresholds, and sandbox/backtest modes fed by historical data snapshots.
-- Scripting/automation: design a lightweight strategy sandbox (Lua or embedded DSL) guarded by permission checks to prevent exploit paths.
+## ?섏씠利?4: 湲곕낯 ?대씪?댁뼵??湲곕뒫 ?뺤옣 (?湲?
+- ?ы듃?대━??酉? ?ㅼ쨷 ?щ낵 ?뚯튂由ъ뒪?? ?꾩쟻 ?먯씡 李⑦듃, 嫄곕옒?뚮퀎 ?붽퀬瑜??ㅼ떆媛꾩쑝濡?吏?먰븳??
+- 二쇰Ц 愿由? OCO, ?몃젅?쇰쭅 ?ㅽ깙 ??怨좉툒 二쇰Ц ?좏삎, ?대씪?댁뼵??痢?寃利? ?몄쭛 媛?ν븳 二쇰Ц ?대젰??援ы쁽?쒕떎.
+- 由ъ뒪???듭젣: ?듭뒪?ъ? ?쒕룄, 寃쎄퀬 ?꾧퀎媛? ?덉뒪?좊━而??곗씠???ㅻ깄?룹쑝濡?援щ룞?섎뒗 ?뚮뱶諛뺤뒪/諛깊뀒?ㅽ듃 紐⑤뱶瑜??ы븿?쒕떎.
+- ?ㅽ겕由쏀똿/?먮룞?? 猷⑥븘(Lua) ?먮뒗 ?댁옣 DSL 湲곕컲??寃쎈웾 ?꾨왂 ?뚮뱶諛뺤뒪瑜??ㅺ퀎?섍퀬, ?낆슜 寃쎈줈瑜?李⑤떒?섍린 ?꾪븳 沅뚰븳 寃?щ? ?곸슜?쒕떎.
 
-## Phase 5: FPS Maximization & Render Loop
-- Double-buffer ImGui draw data, using a staging queue for GPU uploads to avoid stalls.
-- Separate static from dynamic widgets; reuse cached draw lists for static panels and collapse redundant draw calls.
-- Introduce a frame graph that logs update, simulation, and render costs each frame with a 120 FPS target gate.
+## ?섏씠利?5: FPS 洹밸???諛??뚮뜑 猷⑦봽 (?湲?
+- GPU ?낅줈???뺤껜瑜??쇳븯湲??꾪빐 ImGui ?쒕줈???곗씠?곕? ?붾툝 踰꾪띁留곹븯怨??ㅽ뀒?댁쭠 ?먮? ?ъ슜?쒕떎.
+- ?뺤쟻 ?꾩젽怨??숈쟻 ?꾩젽??遺꾨━?섍퀬, ?뺤쟻 ?⑤꼸?먮뒗 罹먯떆???쒕줈??由ъ뒪?몃? ?ъ궗?⑺븯硫?以묐났 ?쒕줈???몄텧??異뺤냼?쒕떎.
+- 媛??꾨젅?꾩쓽 ?낅뜲?댄듃, ?쒕??덉씠?? ?뚮뜑 鍮꾩슜??湲곕줉?섎뒗 ?꾨젅??洹몃옒?꾨? ?꾩엯?섍퀬 120 FPS 紐⑺몴 寃뚯씠?몃? ?ㅼ젙?쒕떎.
 
-## Phase 6: Modern UI & Visual Polish
-- Define theme tokens (color, spacing, typography) in `assets/style.json` and load at startup; centralize style tweaks.
-- Redesign layouts with modular card components, status badges, responsive chart overlays, and contextual tooltips for clarity.
-- Add accessibility checks for contrast, keyboard navigation, and HiDPI scaling before feature sign-off.
+## ?섏씠利?6: 紐⑤뜕 UI 諛?鍮꾩＜???ㅻ벉湲?(?湲?
+- `assets/style.json`???됱긽, 媛꾧꺽, ??댄룷洹몃옒?????뚮쭏 ?좏겙???뺤쓽?섍퀬 ?쒖옉 ??濡쒕뱶???ㅽ???蹂寃쎌쓣 以묒븰吏묒쨷?뷀븳??
+- 紐⑤뱢??移대뱶 而댄룷?뚰듃, ?곹깭 諛곗?, 諛섏쓳??李⑦듃 ?ㅻ쾭?덉씠, 臾몃㎘ 湲곕컲 ?댄똻?쇰줈 ?덉씠?꾩썐???ъ꽕怨꾪븳??
+- 湲곕뒫 醫낅즺 ???鍮? ?ㅻ낫???대퉬寃뚯씠?? HiDPI ?ㅼ??쇰쭅???ы븿???묎렐??寃?щ? 異붽??쒕떎.
 
-Every phase must ship bug-free by re-running baseline checks, expanding tests as new features land, and halting rollout if regressions appear.
+紐⑤뱺 ?섏씠利덈뒗 湲곗???寃?щ? ?ъ떎?됲븯怨?湲곕뒫 異붽???留욎떠 ?뚯뒪?몃? ?뺤옣?섎ŉ ?뚭?媛 媛먯??섎㈃ 利됱떆 濡ㅼ븘?껋쓣 以묐떒?쒕떎.
